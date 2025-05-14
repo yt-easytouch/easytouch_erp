@@ -13,8 +13,8 @@ app_logo_url = "/assets/erpnext/images/easytouch-logo.svg"
 add_to_apps_screen = [
 	{
 		"name": "erpnext",
-		"logo": "/assets/erpnext/images/erpnext-logo-blue.png",
-		"title": "ERPNext",
+		"logo": "/assets/erpnext/images/easytouch_logo.png",
+		"title": "Easytouch ERP",
 		"route": "/app/home",
 		"has_permission": "erpnext.check_app_permission",
 	}
