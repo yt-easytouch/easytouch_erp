@@ -11,6 +11,7 @@ import erpnext.controllers
 import erpnext.controllers.status_updater
 from erpnext.accounts.doctype.account.test_account import get_inventory_account
 from erpnext.buying.doctype.supplier.test_supplier import create_supplier
+from erpnext.controllers.accounts_controller import InvalidQtyError
 from erpnext.controllers.buying_controller import QtyMismatchError
 from erpnext.stock import get_warehouse_account_map
 from erpnext.stock.doctype.item.test_item import create_item, make_item
@@ -31,6 +32,23 @@ from erpnext.stock.doctype.warehouse.test_warehouse import create_warehouse
 class TestPurchaseReceipt(FrappeTestCase):
 	def setUp(self):
 		frappe.db.set_single_value("Buying Settings", "allow_multiple_items", 1)
+
+	def test_purchase_receipt_qty(self):
+		pr = make_purchase_receipt(qty=0, rejected_qty=0, do_not_save=True)
+		with self.assertRaises(InvalidQtyError):
+			pr.save()
+
+		# No error with qty=1
+		pr.items[0].qty = 1
+		pr.save()
+		self.assertEqual(pr.items[0].qty, 1)
+
+		# No error with rejected_qty=1
+		pr.items[0].rejected_warehouse = "_Test Rejected Warehouse - _TC"
+		pr.items[0].rejected_qty = 1
+		pr.items[0].qty = 0
+		pr.save()
+		self.assertEqual(pr.items[0].rejected_qty, 1)
 
 	def test_purchase_receipt_received_qty(self):
 		"""
@@ -3363,7 +3381,6 @@ class TestPurchaseReceipt(FrappeTestCase):
 		self.assertEqual(pr.status, "Completed")
 
 	def test_internal_transfer_for_batch_items_with_cancel(self):
-		from erpnext.controllers.sales_and_purchase_return import make_return_doc
 		from erpnext.stock.doctype.delivery_note.delivery_note import make_inter_company_purchase_receipt
 		from erpnext.stock.doctype.delivery_note.test_delivery_note import create_delivery_note
 
@@ -3479,7 +3496,6 @@ class TestPurchaseReceipt(FrappeTestCase):
 		frappe.db.set_single_value("Stock Settings", "use_serial_batch_fields", 1)
 
 	def test_internal_transfer_for_batch_items_with_cancel_use_serial_batch_fields(self):
-		from erpnext.controllers.sales_and_purchase_return import make_return_doc
 		from erpnext.stock.doctype.delivery_note.delivery_note import make_inter_company_purchase_receipt
 		from erpnext.stock.doctype.delivery_note.test_delivery_note import create_delivery_note
 
@@ -4061,7 +4077,6 @@ class TestPurchaseReceipt(FrappeTestCase):
 			make_purchase_receipt as _make_purchase_receipt,
 		)
 		from erpnext.buying.doctype.purchase_order.test_purchase_order import (
-			create_pr_against_po,
 			create_purchase_order,
 		)
 
@@ -4183,6 +4198,126 @@ class TestPurchaseReceipt(FrappeTestCase):
 
 		# Test 3 - OverAllowanceError should be thrown as qty is greater than qty in DN
 		self.assertRaises(erpnext.controllers.status_updater.OverAllowanceError, pr.submit)
+
+	def test_valuation_rate_for_rejected_materials(self):
+		item = make_item("Test Item with Rej Material Valuation", {"is_stock_item": 1})
+		company = "_Test Company with perpetual inventory"
+
+		warehouse = create_warehouse(
+			"_Test In-ward Warehouse",
+			company="_Test Company with perpetual inventory",
+		)
+
+		rej_warehouse = create_warehouse(
+			"_Test Warehouse - Rejected Material",
+			company="_Test Company with perpetual inventory",
+		)
+
+		frappe.db.set_single_value("Buying Settings", "bill_for_rejected_quantity_in_purchase_invoice", 1)
+
+		frappe.db.set_single_value("Buying Settings", "set_valuation_rate_for_rejected_materials", 1)
+
+		pr = make_purchase_receipt(
+			item_code=item.name,
+			qty=10,
+			rate=100,
+			company=company,
+			warehouse=warehouse,
+			rejected_qty=5,
+			rejected_warehouse=rej_warehouse,
+		)
+
+		stock_received_but_not_billed_account = frappe.get_value(
+			"Company",
+			company,
+			"stock_received_but_not_billed",
+		)
+
+		rejected_item_cost = frappe.db.get_value(
+			"Stock Ledger Entry",
+			{
+				"voucher_type": "Purchase Receipt",
+				"voucher_no": pr.name,
+				"warehouse": rej_warehouse,
+			},
+			"stock_value_difference",
+		)
+
+		self.assertEqual(rejected_item_cost, 500)
+
+		srbnb_cost = frappe.db.get_value(
+			"GL Entry",
+			{
+				"voucher_type": "Purchase Receipt",
+				"voucher_no": pr.name,
+				"account": stock_received_but_not_billed_account,
+			},
+			"credit",
+		)
+
+		self.assertEqual(srbnb_cost, 1500)
+
+		frappe.db.set_single_value("Buying Settings", "bill_for_rejected_quantity_in_purchase_invoice", 0)
+
+		frappe.db.set_single_value("Buying Settings", "set_valuation_rate_for_rejected_materials", 0)
+
+	def test_no_valuation_rate_for_rejected_materials(self):
+		item = make_item("Test Item with Rej Material No Valuation", {"is_stock_item": 1})
+		company = "_Test Company with perpetual inventory"
+
+		warehouse = create_warehouse(
+			"_Test In-ward Warehouse",
+			company="_Test Company with perpetual inventory",
+		)
+
+		rej_warehouse = create_warehouse(
+			"_Test Warehouse - Rejected Material",
+			company="_Test Company with perpetual inventory",
+		)
+
+		frappe.db.set_single_value("Buying Settings", "bill_for_rejected_quantity_in_purchase_invoice", 0)
+
+		frappe.db.set_single_value("Buying Settings", "set_valuation_rate_for_rejected_materials", 0)
+
+		pr = make_purchase_receipt(
+			item_code=item.name,
+			qty=10,
+			rate=100,
+			company=company,
+			warehouse=warehouse,
+			rejected_qty=5,
+			rejected_warehouse=rej_warehouse,
+		)
+
+		stock_received_but_not_billed_account = frappe.get_value(
+			"Company",
+			company,
+			"stock_received_but_not_billed",
+		)
+
+		rejected_item_cost = frappe.db.get_value(
+			"Stock Ledger Entry",
+			{
+				"voucher_type": "Purchase Receipt",
+				"voucher_no": pr.name,
+				"warehouse": rej_warehouse,
+			},
+			"stock_value_difference",
+		)
+
+		self.assertEqual(rejected_item_cost, 0.0)
+
+		srbnb_cost = frappe.db.get_value(
+			"GL Entry",
+			{
+				"voucher_type": "Purchase Receipt",
+				"voucher_no": pr.name,
+				"account": stock_received_but_not_billed_account,
+			},
+			"credit",
+		)
+
+		self.assertEqual(srbnb_cost, 1000)
 
 
 def prepare_data_for_internal_transfer():
@@ -4353,7 +4488,8 @@ def make_purchase_receipt(**args):
 	pr.is_return = args.is_return
 	pr.return_against = args.return_against
 	pr.apply_putaway_rule = args.apply_putaway_rule
-	qty = args.qty or 5
+
+	qty = args.qty if args.qty is not None else 5
 	rejected_qty = args.rejected_qty or 0
 	received_qty = args.received_qty or flt(rejected_qty) + flt(qty)
 
