@@ -36,6 +36,17 @@ def validate_return_against(doc):
 
 		party_type = "customer" if doc.doctype in ("Sales Invoice", "Delivery Note") else "supplier"
 
+		if ref_doc.get(party_type) != doc.get(party_type):
+			frappe.throw(
+				_("The {0} {1} does not match with the {0} {2} in the {3} {4}").format(
+					doc.meta.get_label(party_type),
+					doc.get(party_type),
+					ref_doc.get(party_type),
+					ref_doc.doctype,
+					ref_doc.name,
+				)
+			)
+
 		if (
 			ref_doc.company == doc.company
 			and ref_doc.get(party_type) == doc.get(party_type)
@@ -679,6 +690,14 @@ def get_rate_for_return(
 				},
 				raise_error_if_no_rate=False,
 			)
+
+	if not rate and voucher_type in ["Sales Invoice", "Delivery Note"]:
+		details = frappe.db.get_value(
+			voucher_type + " Item", voucher_detail_no, ["rate", "allow_zero_valuation_rate"], as_dict=1
+		)
+
+		if details and not details.allow_zero_valuation_rate:
+			rate = flt(details.rate)
 
 	return rate
 

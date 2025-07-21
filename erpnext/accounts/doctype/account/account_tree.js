@@ -138,6 +138,11 @@ frappe.treeview_settings["Account"] = {
 			description: __(
 				"Further accounts can be made under Groups, but entries can be made against non-Groups"
 			),
+			onchange: function () {
+				if (!this.value) {
+					this.layout.set_value("root_type", "");
+				}
+			},
 		},
 		{
 			fieldtype: "Select",
@@ -247,6 +252,10 @@ frappe.treeview_settings["Account"] = {
 							root_company,
 						]);
 					} else {
+						const node = treeview.tree.get_selected_node();
+						if (node.is_root) {
+							frappe.throw(__("Cannot create root account."));
+						}
 						treeview.new_node();
 					}
 				},
@@ -265,7 +274,8 @@ frappe.treeview_settings["Account"] = {
 					].treeview.page.fields_dict.root_company.get_value() ||
 						frappe.flags.ignore_root_company_validation) &&
 					node.expandable &&
-					!node.hide_add
+					!node.hide_add &&
+					!node.is_root
 				);
 			},
 			click: function () {

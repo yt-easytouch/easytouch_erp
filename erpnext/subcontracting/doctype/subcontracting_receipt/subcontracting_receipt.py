@@ -152,7 +152,7 @@ class SubcontractingReceipt(SubcontractingController):
 		self.validate_available_qty_for_consumption()
 		self.update_status_updater_args()
 		self.update_prevdoc_status()
-		self.set_subcontracting_order_status()
+		self.set_subcontracting_order_status(update_bin=False)
 		self.set_consumed_qty_in_subcontract_order()
 
 		for table_name in ["items", "supplied_items"]:
@@ -179,7 +179,7 @@ class SubcontractingReceipt(SubcontractingController):
 		self.update_status_updater_args()
 		self.update_prevdoc_status()
 		self.set_consumed_qty_in_subcontract_order()
-		self.set_subcontracting_order_status()
+		self.set_subcontracting_order_status(update_bin=False)
 		self.update_stock_ledger()
 		self.make_gl_entries_on_cancel()
 		self.repost_future_sle_and_gle()
@@ -619,11 +619,11 @@ class SubcontractingReceipt(SubcontractingController):
 							self.add_gl_entry(
 								gl_entries=gl_entries,
 								account=supplier_warehouse_account,
-								cost_center=rm_item.cost_center,
+								cost_center=rm_item.cost_center or item.cost_center,
 								debit=0.0,
 								credit=flt(rm_item.amount),
 								remarks=remarks,
-								against_account=rm_item.expense_account,
+								against_account=rm_item.expense_account or item.expense_account,
 								account_currency=get_account_currency(supplier_warehouse_account),
 								project=item.project,
 								item=item,
@@ -631,8 +631,8 @@ class SubcontractingReceipt(SubcontractingController):
 							# Expense Account (Debit)
 							self.add_gl_entry(
 								gl_entries=gl_entries,
-								account=rm_item.expense_account,
-								cost_center=rm_item.cost_center,
+								account=rm_item.expense_account or item.expense_account,
+								cost_center=rm_item.cost_center or item.cost_center,
 								debit=flt(rm_item.amount),
 								credit=0.0,
 								remarks=remarks,
