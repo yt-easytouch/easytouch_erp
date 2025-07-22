@@ -46,7 +46,7 @@ def get_level():
 			activation_level += 1
 		sales_data.append({doctype: count})
 
-	if "erpnext" in get_setup_wizard_completed_apps():
+	if "erpnext" in frappe.get_installed_apps():
 		activation_level += 1
 
 	communication_number = frappe.db.count("Communication", dict(communication_medium="Email"))
