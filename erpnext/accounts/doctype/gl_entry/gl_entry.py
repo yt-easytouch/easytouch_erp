@@ -311,7 +311,7 @@ def validate_balance_type(account, adv_adj=False):
 		if balance_must_be:
 			balance = frappe.db.sql(
 				"""select sum(debit) - sum(credit)
-				from `tabGL Entry` where account = %s""",
+				from `tabGL Entry` where is_cancelled = 0 and account = %s""",
 				account,
 			)[0][0]
 
@@ -462,4 +462,9 @@ def rename_temporarily_named_docs(doctype):
 				f"UPDATE `tab{doctype}` SET name = %s, to_rename = 0, modified = %s where name = %s",
 				(newname, now(), oldname),
 			)
+
+			for hook_type in ("on_gle_rename", "on_sle_rename"):
+				for hook in frappe.get_hooks(hook_type):
+					frappe.call(hook, newname=newname, oldname=oldname)
+
 		frappe.db.commit()

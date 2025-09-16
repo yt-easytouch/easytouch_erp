@@ -112,6 +112,7 @@ class SerialBatchBundle:
 				"company": self.company,
 				"is_rejected": self.is_rejected_entry(),
 				"make_bundle_from_sle": 1,
+				"sle": self.sle,
 			}
 		).make_serial_and_batch_bundle()
 
@@ -184,7 +185,21 @@ class SerialBatchBundle:
 			}
 
 			if self.sle.actual_qty < 0 and self.is_material_transfer():
-				values_to_update["valuation_rate"] = flt(sn_doc.avg_rate)
+				basic_rate = flt(sn_doc.avg_rate)
+				ste_detail = frappe.db.get_value(
+					"Stock Entry Detail",
+					self.sle.voucher_detail_no,
+					["additional_cost", "transfer_qty"],
+					as_dict=True,
+				)
+
+				additional_cost = 0.0
+
+				if ste_detail:
+					additional_cost = flt(ste_detail.additional_cost) / flt(ste_detail.transfer_qty)
+
+				values_to_update["basic_rate"] = basic_rate
+				values_to_update["valuation_rate"] = basic_rate + additional_cost
 
 			if not frappe.db.get_single_value(
 				"Stock Settings", "do_not_update_serial_batch_on_creation_of_auto_bundle"
@@ -359,7 +374,7 @@ class SerialBatchBundle:
 		self.update_serial_no_status_warehouse(self.sle, serial_nos)
 
 	def update_serial_no_status_warehouse(self, sle, serial_nos):
-		warehouse = self.warehouse if sle.actual_qty > 0 else None
+		warehouse = sle.warehouse if sle.actual_qty > 0 else None
 
 		if isinstance(serial_nos, str):
 			serial_nos = [serial_nos]
@@ -659,6 +674,7 @@ class BatchNoValuation(DeprecatedBatchNoValuation):
 		for key, value in kwargs.items():
 			setattr(self, key, value)
 
+		self.stock_queue = []
 		self.batch_nos = self.get_batch_nos()
 		self.prepare_batches()
 		self.calculate_avg_rate()
@@ -723,6 +739,7 @@ class BatchNoValuation(DeprecatedBatchNoValuation):
 				& (parent.is_cancelled == 0)
 				& (parent.type_of_transaction.isin(["Inward", "Outward"]))
 			)
+			.for_update()
 			.groupby(child.batch_no)
 		)
 
@@ -1003,6 +1020,14 @@ class SerialBatchCreation:
 
 		if not hasattr(self, "do_not_submit") or not self.do_not_submit:
 			doc.flags.ignore_voucher_validation = True
+			if self.get("sle"):
+				doc.flags.ignore_validate = True
+				doc.save()
+				self.sle.db_set("serial_and_batch_bundle", doc.name, update_modified=False)
+
+			if doc.flags.ignore_validate:
+				doc.flags.ignore_validate = False
+
 			doc.submit()
 		else:
 			doc.save()

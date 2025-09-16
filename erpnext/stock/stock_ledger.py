@@ -1030,6 +1030,15 @@ class update_entries_after:
 			doc.set_incoming_rate(save=True, allow_negative_stock=self.allow_negative_stock)
 			doc.calculate_qty_and_amount(save=True)
 
+		if stock_queue := frappe.get_all(
+			"Serial and Batch Entry",
+			filters={"parent": sle.serial_and_batch_bundle, "stock_queue": ("is", "set")},
+			pluck="stock_queue",
+			order_by="idx desc",
+			limit=1,
+		):
+			self.wh_data.stock_queue = json.loads(stock_queue[0]) if stock_queue else []
+
 		self.wh_data.stock_value = round_off_if_near_zero(self.wh_data.stock_value + doc.total_amount)
 		self.wh_data.qty_after_transaction += flt(doc.total_qty, self.flt_precision)
 		if flt(self.wh_data.qty_after_transaction, self.flt_precision):
@@ -1670,8 +1679,20 @@ def get_stock_ledger_entries(
 ):
 	"""get stock ledger entries filtered by specific posting datetime conditions"""
 	conditions = f" and posting_datetime {operator} %(posting_datetime)s"
-	if previous_sle.get("warehouse"):
-		conditions += " and warehouse = %(warehouse)s"
+
+	if item_code := previous_sle.get("item_code"):
+		if isinstance(item_code, list | tuple):
+			conditions += " and item_code in %(item_code)s"
+		else:
+			conditions += " and item_code = %(item_code)s"
+
+	if warehouse := previous_sle.get("warehouse"):
+		if isinstance(warehouse, list | tuple):
+			conditions += " and warehouse in %(warehouse)s"
+
+		else:
+			conditions += " and warehouse = %(warehouse)s"
+
 	elif previous_sle.get("warehouse_condition"):
 		conditions += " and " + previous_sle.get("warehouse_condition")
 
@@ -1714,8 +1735,7 @@ def get_stock_ledger_entries(
 		"""
 		select *, posting_datetime as "timestamp"
 		from `tabStock Ledger Entry`
-		where item_code = %(item_code)s
-		and is_cancelled = 0
+		where is_cancelled = 0
 		{conditions}
 		order by posting_datetime {order}, creation {order}
 		{limit} {for_update}""".format(

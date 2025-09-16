@@ -1612,7 +1612,7 @@ class StockEntry(StockController):
 						)
 					)
 
-		return process_gl_map(gl_entries)
+		return process_gl_map(gl_entries, from_repost=frappe.flags.through_repost_item_valuation)
 
 	def update_work_order(self):
 		def _validate_work_order(pro_doc):
@@ -2123,7 +2123,16 @@ class StockEntry(StockController):
 					"Work Order", self.work_order, "allow_alternative_item"
 				)
 
-			item.from_warehouse = self.from_warehouse or item.source_warehouse or item.default_warehouse
+			item.from_warehouse = (
+				frappe.get_value(
+					"Work Order Item",
+					{"parent": self.work_order, "item_code": item.item_code},
+					"source_warehouse",
+				)
+				if frappe.get_value("Work Order", self.work_order, "skip_transfer")
+				and not frappe.get_value("Work Order", self.work_order, "from_wip_warehouse")
+				else self.from_warehouse or item.source_warehouse or item.default_warehouse
+			)
 			if item.item_code in used_alternative_items:
 				alternative_item_data = used_alternative_items.get(item.item_code)
 				item.item_code = alternative_item_data.item_code

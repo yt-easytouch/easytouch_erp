@@ -12,7 +12,6 @@ erpnext.buying.setup_buying_controller();
 
 frappe.ui.form.on("Purchase Order", {
 	setup: function (frm) {
-		frm.ignore_doctypes_on_cancel_all = ["Unreconcile Payment", "Unreconcile Payment Entries"];
 		if (frm.doc.is_old_subcontracting_flow) {
 			frm.set_query("reserve_warehouse", "supplied_items", function () {
 				return {
@@ -140,6 +139,10 @@ frappe.ui.form.on("Purchase Order", {
 	},
 
 	onload: function (frm) {
+		var ignore_list = ["Unreconcile Payment", "Unreconcile Payment Entries"];
+		frm.ignore_doctypes_on_cancel_all = Object.hasOwn(frm, "ignore_doctypes_on_cancel_all")
+			? frm.ignore_doctypes_on_cancel_all.concat(ignore_list)
+			: ignore_list;
 		set_schedule_date(frm);
 		if (!frm.doc.transaction_date) {
 			frm.set_value("transaction_date", frappe.datetime.get_today());
@@ -460,8 +463,8 @@ erpnext.buying.PurchaseOrderController = class PurchaseOrderController extends (
 						if (internal) {
 							let button_label =
 								me.frm.doc.company === me.frm.doc.represents_company
-									? "Internal Sales Order"
-									: "Inter Company Sales Order";
+									? __("Internal Sales Order")
+									: __("Inter Company Sales Order");
 
 							me.frm.add_custom_button(
 								button_label,
@@ -575,7 +578,7 @@ erpnext.buying.PurchaseOrderController = class PurchaseOrderController extends (
 					},
 					allow_child_item_selection: true,
 					child_fieldname: "items",
-					child_columns: ["item_code", "qty", "ordered_qty"],
+					child_columns: ["item_code", "item_name", "qty", "ordered_qty"],
 				});
 			},
 			__("Get Items From")
@@ -596,6 +599,9 @@ erpnext.buying.PurchaseOrderController = class PurchaseOrderController extends (
 						docstatus: 1,
 						status: ["not in", ["Stopped", "Expired"]],
 					},
+					allow_child_item_selection: true,
+					child_fieldname: "items",
+					child_columns: ["item_code", "item_name", "qty", "rate", "amount"],
 				});
 			},
 			__("Get Items From")
