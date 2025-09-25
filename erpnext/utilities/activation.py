@@ -7,9 +7,9 @@ from frappe import _
 import erpnext
 
 
-def get_level():
-	activation_level = 0
-	sales_data = []
+def get_level(site_info):
+	activation_level = site_info.get("activation", {}).get("activation_level", 0)
+	sales_data = site_info.get("activation", {}).get("sales_data", [])
 	min_count = 0
 	doctypes = {
 		"Asset": 5,
