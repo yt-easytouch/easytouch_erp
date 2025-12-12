@@ -116,7 +116,7 @@ frappe.ui.form.on("Customer", {
 					address_dict: frm.doc.customer_primary_address,
 				},
 				callback: function (r) {
-					frm.set_value("primary_address", r.message);
+					frm.set_value("primary_address", frappe.utils.html2text(r.message));
 				},
 			});
 		}
@@ -215,6 +215,22 @@ frappe.ui.form.on("Customer", {
 		var grid = cur_frm.get_field("sales_team").grid;
 		grid.set_column_disp("allocated_amount", false);
 		grid.set_column_disp("incentives", false);
+
+		frm.set_query("customer_group", () => {
+			return {
+				filters: {
+					is_group: 0,
+				},
+			};
+		});
+
+		frm.set_query("territory", () => {
+			return {
+				filters: {
+					is_group: 0,
+				},
+			};
+		});
 	},
 	validate: function (frm) {
 		if (frm.doc.lead_name) frappe.model.clear_doc("Lead", frm.doc.lead_name);
