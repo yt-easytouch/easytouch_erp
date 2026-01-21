@@ -11,9 +11,7 @@ from frappe.model.meta import get_field_precision
 from frappe.query_builder import Order
 from frappe.query_builder.functions import Sum
 from frappe.utils import (
-	add_to_date,
 	cint,
-	cstr,
 	flt,
 	format_date,
 	get_link_to_form,
@@ -724,13 +722,6 @@ class update_entries_after:
 			{"item_code": self.item_code, "warehouse": self.args.warehouse}
 		)
 
-		key = (self.item_code, self.args.warehouse)
-		if key in self.distinct_item_warehouses and self.distinct_item_warehouses[key].get(
-			"transfer_entry_to_repost"
-		):
-			# only repost stock entries
-			args["filter_voucher_type"] = "Stock Entry"
-
 		return list(self.get_sle_after_datetime(args))
 
 	def get_dependent_entries_to_fix(self, entries_to_fix, sle):
@@ -1183,7 +1174,11 @@ class update_entries_after:
 		diff = self.wh_data.qty_after_transaction + flt(sle.actual_qty) - flt(self.reserved_stock)
 		diff = flt(diff, self.flt_precision)  # respect system precision
 
-		if diff < 0 and abs(diff) > 0.0001:
+		diff_threshold = 0.0001
+		if self.flt_precision > 4:
+			diff_threshold = 10 ** (-1 * self.flt_precision)
+
+		if diff < 0 and abs(diff) > diff_threshold:
 			# negative stock!
 			exc = sle.copy().update({"diff": diff})
 			self.exceptions.setdefault(sle.warehouse, []).append(exc)
@@ -1863,9 +1858,6 @@ def get_stock_ledger_entries(
 	if operator in (">", "<=") and previous_sle.get("name"):
 		conditions += " and name!=%(name)s"
 
-	if previous_sle.get("filter_voucher_type"):
-		conditions += " and voucher_type = %(filter_voucher_type)s"
-
 	if extra_cond:
 		conditions += f"{extra_cond}"
 
@@ -1907,31 +1899,6 @@ def get_sle_by_voucher_detail_no(voucher_detail_no, excluded_sle=None):
 		],
 		as_dict=1,
 	)
-
-
-def get_batch_incoming_rate(item_code, warehouse, batch_no, posting_date, posting_time, creation=None):
-	sle = frappe.qb.DocType("Stock Ledger Entry")
-
-	timestamp_condition = sle.posting_datetime < get_combine_datetime(posting_date, posting_time)
-	if creation:
-		timestamp_condition |= (sle.posting_datetime == get_combine_datetime(posting_date, posting_time)) & (
-			sle.creation < creation
-		)
-
-	batch_details = (
-		frappe.qb.from_(sle)
-		.select(Sum(sle.stock_value_difference).as_("batch_value"), Sum(sle.actual_qty).as_("batch_qty"))
-		.where(
-			(sle.item_code == item_code)
-			& (sle.warehouse == warehouse)
-			& (sle.batch_no == batch_no)
-			& (sle.is_cancelled == 0)
-		)
-		.where(timestamp_condition)
-	).run(as_dict=True)
-
-	if batch_details and batch_details[0].batch_qty:
-		return batch_details[0].batch_value / batch_details[0].batch_qty
 
 
 def get_valuation_rate(

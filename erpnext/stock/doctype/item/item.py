@@ -1,8 +1,6 @@
 # Copyright (c) 2021, Frappe Technologies Pvt. Ltd. and Contributors
 # License: GNU General Public License v3. See license.txt
 
-import copy
-import json
 
 import frappe
 from frappe import _, bold
@@ -20,7 +18,6 @@ from frappe.utils import (
 	now_datetime,
 	nowtime,
 	strip,
-	strip_html,
 )
 from frappe.utils.html_utils import clean_html
 from pypika import Order
@@ -129,11 +126,13 @@ class Item(Document):
 		over_billing_allowance: DF.Float
 		over_delivery_receipt_allowance: DF.Float
 		production_capacity: DF.Int
+		purchase_tax_withholding_category: DF.Link | None
 		purchase_uom: DF.Link | None
 		quality_inspection_template: DF.Link | None
 		reorder_levels: DF.Table[ItemReorder]
 		retain_sample: DF.Check
 		safety_stock: DF.Float
+		sales_tax_withholding_category: DF.Link | None
 		sales_uom: DF.Link | None
 		sample_quantity: DF.Int
 		serial_no_series: DF.Data | None
@@ -181,7 +180,23 @@ class Item(Document):
 				self.add_price(default.default_price_list)
 
 		if self.opening_stock:
-			self.set_opening_stock()
+			if self.opening_stock > 10000 and self.has_serial_no:
+				frappe.enqueue(
+					self.set_opening_stock,
+					queue="long",
+					timeout=600,
+					job_name=f"set_opening_stock_for_{self.name}",
+				)
+				frappe.msgprint(
+					_(
+						"Opening stock creation has been queued and will be created in the background. Please check the stock entry after some time."
+					),
+					indicator="orange",
+					alert=True,
+				)
+
+			else:
+				self.set_opening_stock()
 
 	def validate(self):
 		if not self.item_name:
@@ -262,7 +277,11 @@ class Item(Document):
 
 	def set_opening_stock(self):
 		"""set opening stock"""
-		if not self.is_stock_item or self.has_serial_no or self.has_batch_no:
+		if (
+			not self.is_stock_item
+			or (self.has_serial_no and not self.serial_no_series)
+			or (self.has_batch_no and (not self.create_new_batch or not self.batch_number_series))
+		):
 			return
 
 		if not self.valuation_rate and not self.standard_rate and not self.is_customer_provided_item:
@@ -482,7 +501,7 @@ class Item(Document):
 					)
 					if item_barcode.barcode_type:
 						barcode_type = convert_erpnext_to_barcodenumber(
-							item_barcode.barcode_type.upper(), item_barcode.barcode
+							item_barcode.barcode_type.replace("-", "").upper(), item_barcode.barcode
 						)
 						if barcode_type in barcodenumber.barcodes():
 							if not barcodenumber.check_code(barcode_type, item_barcode.barcode):

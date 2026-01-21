@@ -2,7 +2,6 @@
 # License: GNU General Public License v3. See license.txt
 
 import frappe
-from frappe.tests import IntegrationTestCase
 from frappe.utils import add_days, getdate, nowdate
 
 from erpnext.projects.doctype.project_template.test_project_template import make_project_template
@@ -255,14 +254,12 @@ class TestProject(ERPNextTestSuite):
 
 def get_project(name, template):
 	project = frappe.get_doc(
-		dict(
-			doctype="Project",
-			project_name=name,
-			status="Open",
-			project_template=template.name,
-			expected_start_date=nowdate(),
-			company="_Test Company",
-		)
+		doctype="Project",
+		project_name=name,
+		status="Open",
+		project_template=template.name,
+		expected_start_date=nowdate(),
+		company="_Test Company",
 	).insert()
 
 	return project
@@ -275,13 +272,11 @@ def make_project(args):
 		return frappe.get_doc("Project", {"project_name": args.project_name})
 
 	project = frappe.get_doc(
-		dict(
-			doctype="Project",
-			project_name=args.project_name,
-			status="Open",
-			expected_start_date=args.start_date,
-			company=args.company or "_Test Company",
-		)
+		doctype="Project",
+		project_name=args.project_name,
+		status="Open",
+		expected_start_date=args.start_date,
+		company=args.company or "_Test Company",
 	)
 
 	if args.project_template_name:

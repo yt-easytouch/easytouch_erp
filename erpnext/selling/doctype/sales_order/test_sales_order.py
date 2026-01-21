@@ -8,7 +8,7 @@ import frappe
 import frappe.permissions
 from frappe.core.doctype.user_permission.test_user_permission import create_user
 from frappe.tests import IntegrationTestCase, change_settings
-from frappe.utils import add_days, flt, getdate, nowdate, today
+from frappe.utils import add_days, flt, nowdate, today
 
 from erpnext.accounts.test.accounts_mixin import AccountsTestMixin
 from erpnext.controllers.accounts_controller import InvalidQtyError, get_due_date, update_child_qty_rate
@@ -2713,8 +2713,8 @@ def make_sales_order_workflow():
 		doc.save()
 		return doc
 
-	frappe.get_doc(dict(doctype="Role", role_name="Test Junior Approver")).insert(ignore_if_duplicate=True)
-	frappe.get_doc(dict(doctype="Role", role_name="Test Approver")).insert(ignore_if_duplicate=True)
+	frappe.get_doc(doctype="Role", role_name="Test Junior Approver").insert(ignore_if_duplicate=True)
+	frappe.get_doc(doctype="Role", role_name="Test Approver").insert(ignore_if_duplicate=True)
 	frappe.cache().hdel("roles", frappe.session.user)
 
 	workflow = frappe.get_doc(

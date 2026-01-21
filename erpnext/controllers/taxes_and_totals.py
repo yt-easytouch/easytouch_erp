@@ -13,7 +13,6 @@ from frappe.utils import cint, flt, round_based_on_smallest_currency_fraction
 import erpnext
 from erpnext.accounts.doctype.journal_entry.journal_entry import get_exchange_rate
 from erpnext.accounts.doctype.pricing_rule.utils import get_applied_pricing_rules
-from erpnext.accounts.utils import get_zero_cutoff
 from erpnext.controllers.accounts_controller import (
 	validate_conversion_rate,
 	validate_inclusive_tax,
@@ -30,11 +29,6 @@ class calculate_taxes_and_totals:
 		frappe.flags.round_off_applicable_accounts = []
 		frappe.flags.round_row_wise_tax = frappe.get_single_value("Accounts Settings", "round_row_wise_tax")
 
-		if doc.get("round_off_applicable_accounts_for_tax_withholding"):
-			frappe.flags.round_off_applicable_accounts.append(
-				doc.round_off_applicable_accounts_for_tax_withholding
-			)
-
 		self._items = self.filter_rows() if self.doc.doctype == "Quotation" else self.doc.get("items")
 		get_round_off_applicable_accounts(self.doc.company, frappe.flags.round_off_applicable_accounts)
 		self.calculate()
@@ -44,16 +38,22 @@ class calculate_taxes_and_totals:
 		items = list(filter(lambda item: not item.get("is_alternative"), self.doc.get("items")))
 		return items
 
-	def calculate(self):
+	def calculate(self, ignore_tax_template_validation=False):
 		if not len(self.doc.items):
 			return
 
 		self.discount_amount_applied = False
+		self.need_recomputation = False
+		self.ignore_tax_template_validation = ignore_tax_template_validation
+
 		self._calculate()
 
 		if self.doc.meta.get_field("discount_amount"):
 			self.set_discount_amount()
 			self.apply_discount_amount()
+
+		if not ignore_tax_template_validation and self.need_recomputation:
+			return self.calculate(ignore_tax_template_validation=True)
 
 		# Update grand total as per cash and non trade discount
 		if self.doc.apply_discount_on == "Grand Total" and self.doc.get("is_cash_or_non_trade_discount"):
@@ -78,25 +78,15 @@ class calculate_taxes_and_totals:
 		self.initialize_taxes()
 		self.determine_exclusive_rate()
 		self.calculate_net_total()
-		self.calculate_tax_withholding_net_total()
 		self.calculate_taxes()
 		self.adjust_grand_total_for_inclusive_tax()
 		self.calculate_totals()
 		self.calculate_total_net_weight()
 
-	def calculate_tax_withholding_net_total(self):
-		if hasattr(self.doc, "tax_withholding_net_total"):
-			sum_net_amount = 0
-			sum_base_net_amount = 0
-			for item in self._items:
-				if hasattr(item, "apply_tds") and item.apply_tds:
-					sum_net_amount += item.net_amount
-					sum_base_net_amount += item.base_net_amount
-
-			self.doc.tax_withholding_net_total = sum_net_amount
-			self.doc.base_tax_withholding_net_total = sum_base_net_amount
-
 	def validate_item_tax_template(self):
+		if self.ignore_tax_template_validation:
+			return
+
 		if self.doc.get("is_return") and self.doc.get("return_against"):
 			return
 
@@ -139,6 +129,10 @@ class calculate_taxes_and_totals:
 								item.idx, frappe.bold(item.item_code)
 							)
 						)
+
+						# For correct tax_amount calculation re-computation is required
+						if self.discount_amount_applied and self.doc.apply_discount_on == "Grand Total":
+							self.need_recomputation = True
 
 	def update_item_tax_map(self):
 		for item in self.doc.items:
@@ -578,16 +572,7 @@ class calculate_taxes_and_totals:
 			current_net_amount = item.net_amount
 			# distribute the tax amount proportionally to each item row
 			actual = flt(tax.tax_amount, tax.precision("tax_amount"))
-
-			if tax.get("is_tax_withholding_account") and item.meta.get_field("apply_tds"):
-				if not item.get("apply_tds") or not self.doc.tax_withholding_net_total:
-					current_tax_amount = 0.0
-				else:
-					current_tax_amount = item.net_amount * actual / self.doc.tax_withholding_net_total
-			else:
-				current_tax_amount = (
-					item.net_amount * actual / self.doc.net_total if self.doc.net_total else 0.0
-				)
+			current_tax_amount = item.net_amount * actual / self.doc.net_total if self.doc.net_total else 0.0
 
 		elif tax.charge_type == "On Net Total":
 			if tax.account_head in item_tax_map:
@@ -1264,11 +1249,6 @@ def get_itemised_tax(doc, with_tax_account=False):
 			tax_info.tax_account = tax.account_head
 
 	return itemised_tax
-
-
-from erpnext.deprecation_dumpster import (
-	taxes_and_totals_get_itemised_taxable_amount as get_itemised_taxable_amount,
-)
 
 
 def get_rounded_tax_amount(itemised_tax, precision):

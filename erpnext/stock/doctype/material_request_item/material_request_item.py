@@ -37,10 +37,12 @@ class MaterialRequestItem(Document):
 		material_request_plan_item: DF.Data | None
 		min_order_qty: DF.Float
 		ordered_qty: DF.Float
+		packed_item: DF.Data | None
 		page_break: DF.Check
 		parent: DF.Data
 		parentfield: DF.Data
 		parenttype: DF.Data
+		picked_qty: DF.Float
 		price_list_rate: DF.Currency
 		production_plan: DF.Link | None
 		project: DF.Link | None

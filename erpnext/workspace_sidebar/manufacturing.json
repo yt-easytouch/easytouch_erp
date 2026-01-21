@@ -14,31 +14,19 @@
    "keep_closed": 0,
    "label": "Home",
    "link_to": "Manufacturing",
+   "link_type": "Workspace",
+   "show_arrow": 0,
+   "type": "Link"
+  },
+  {
+   "child": 0,
+   "collapsible": 1,
+   "icon": "chart",
+   "indent": 0,
+   "keep_closed": 0,
+   "label": "Dashboard",
+   "link_to": "Manufacturing",
    "link_type": "Dashboard",
-   "show_arrow": 0,
-   "type": "Link"
-  },
-  {
-   "child": 0,
-   "collapsible": 1,
-   "icon": "notebook-tabs",
-   "indent": 0,
-   "keep_closed": 0,
-   "label": "Item",
-   "link_to": "Item",
-   "link_type": "DocType",
-   "show_arrow": 0,
-   "type": "Link"
-  },
-  {
-   "child": 0,
-   "collapsible": 1,
-   "icon": "warehouse",
-   "indent": 0,
-   "keep_closed": 0,
-   "label": "Warehouse",
-   "link_to": "Warehouse",
-   "link_type": "DocType",
    "show_arrow": 0,
    "type": "Link"
   },
@@ -350,6 +338,18 @@
    "icon": "",
    "indent": 0,
    "keep_closed": 0,
+   "label": "Item",
+   "link_to": "Item",
+   "link_type": "DocType",
+   "show_arrow": 0,
+   "type": "Link"
+  },
+  {
+   "child": 1,
+   "collapsible": 1,
+   "icon": "",
+   "indent": 0,
+   "keep_closed": 0,
    "label": "Warehouse",
    "link_to": "Warehouse",
    "link_type": "DocType",
@@ -425,10 +425,11 @@
    "type": "Link"
   }
  ],
- "modified": "2025-11-25 10:46:09.349984",
+ "modified": "2026-01-10 00:06:13.058137",
  "modified_by": "Administrator",
  "module": "Manufacturing",
  "name": "Manufacturing",
  "owner": "Administrator",
+ "standard": 1,
  "title": "Manufacturing"
 }

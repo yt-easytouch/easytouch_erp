@@ -41,6 +41,7 @@ frappe.ui.form.on("Payment Entry", {
 
 		if (frm.is_new()) {
 			set_default_party_type(frm);
+			frm.clear_table("tax_withholding_entries");
 		}
 	},
 
@@ -181,7 +182,7 @@ frappe.ui.form.on("Payment Entry", {
 				"Dunning",
 			];
 
-			if (in_list(party_type_doctypes, child.reference_doctype)) {
+			if (party_type_doctypes.includes(child.reference_doctype)) {
 				filters[doc.party_type.toLowerCase()] = doc.party;
 			}
 
@@ -426,7 +427,15 @@ frappe.ui.form.on("Payment Entry", {
 
 		if (frm.doc.payment_type == "Internal Transfer") {
 			$.each(
-				["party", "party_type", "paid_from", "paid_to", "references", "total_allocated_amount"],
+				[
+					"party",
+					"party_type",
+					"paid_from",
+					"paid_to",
+					"references",
+					"total_allocated_amount",
+					"party_name",
+				],
 				function (i, field) {
 					frm.set_value(field, null);
 				}
@@ -532,6 +541,7 @@ frappe.ui.form.on("Payment Entry", {
 							},
 							() => frm.set_value("party_name", r.message.party_name),
 							() => frm.clear_table("references"),
+							() => frm.clear_table("tax_withholding_entries"),
 							() => frm.events.hide_unhide_fields(frm),
 							() => frm.events.set_dynamic_labels(frm),
 							() => {
@@ -564,14 +574,15 @@ frappe.ui.form.on("Payment Entry", {
 		}
 	},
 
-	apply_tax_withholding_amount: function (frm) {
-		if (!frm.doc.apply_tax_withholding_amount) {
+	apply_tds: function (frm) {
+		if (!frm.doc.apply_tds) {
 			frm.set_value("tax_withholding_category", "");
-		} else {
-			frappe.db.get_value("Supplier", frm.doc.party, "tax_withholding_category", (values) => {
+		} else if (["Customer", "Supplier"].includes(frm.doc.party_type)) {
+			frappe.db.get_value(frm.doc.party_type, frm.doc.party, "tax_withholding_category", (values) => {
 				frm.set_value("tax_withholding_category", values.tax_withholding_category);
 			});
 		}
+		frm.clear_table("tax_withholding_entries");
 	},
 
 	paid_from: function (frm) {
@@ -1030,7 +1041,7 @@ frappe.ui.form.on("Payment Entry", {
 						c.allocated_amount = d.allocated_amount;
 						c.account = d.account;
 
-						if (!in_list(frm.events.get_order_doctypes(frm), d.voucher_type)) {
+						if (!frm.events.get_order_doctypes(frm).includes(d.voucher_type)) {
 							if (flt(d.outstanding_amount) > 0)
 								total_positive_outstanding += flt(d.outstanding_amount);
 							else total_negative_outstanding += Math.abs(flt(d.outstanding_amount));
@@ -1046,7 +1057,7 @@ frappe.ui.form.on("Payment Entry", {
 						} else {
 							c.exchange_rate = 1;
 						}
-						if (in_list(frm.events.get_invoice_doctypes(frm), d.reference_doctype)) {
+						if (frm.events.get_invoice_doctypes(frm).includes(d.reference_doctype)) {
 							c.due_date = d.due_date;
 						}
 					});
@@ -1277,15 +1288,14 @@ frappe.ui.form.on("Payment Entry", {
 		let row = (frm.doc.deductions || []).find((t) => t.is_exchange_gain_loss);
 
 		if (!row) {
-			const response = await get_company_defaults(frm.doc.company);
-
+			const company_defaults = frappe.get_doc(":Company", frm.doc.company);
 			const account =
-				response.message?.[account_fieldname] ||
+				company_defaults?.[account_fieldname] ||
 				(await prompt_for_missing_account(frm, account_fieldname));
 
 			row = frm.add_child("deductions");
 			row.account = account;
-			row.cost_center = response.message?.cost_center;
+			row.cost_center = company_defaults?.cost_center;
 			row.is_exchange_gain_loss = 1;
 		}
 
@@ -1495,18 +1505,14 @@ frappe.ui.form.on("Payment Entry", {
 				"Can refer row only if the charge type is 'On Previous Row Amount' or 'Previous Row Total'"
 			);
 			d.row_id = "";
-		} else if (
-			(d.charge_type == "On Previous Row Amount" || d.charge_type == "On Previous Row Total") &&
-			d.row_id
-		) {
+		} else if (d.charge_type == "On Previous Row Amount" || d.charge_type == "On Previous Row Total") {
 			if (d.idx == 1) {
 				msg = __(
 					"Cannot select charge type as 'On Previous Row Amount' or 'On Previous Row Total' for first row"
 				);
 				d.charge_type = "";
 			} else if (!d.row_id) {
-				msg = __("Please specify a valid Row ID for row {0} in table {1}", [d.idx, __(d.doctype)]);
-				d.row_id = "";
+				d.row_id = d.idx - 1;
 			} else if (d.row_id && d.row_id >= d.idx) {
 				msg = __(
 					"Cannot refer row number greater than or equal to current row number for this Charge type"

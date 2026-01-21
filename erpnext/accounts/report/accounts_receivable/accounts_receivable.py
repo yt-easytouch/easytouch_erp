@@ -877,11 +877,15 @@ class ReceivablePayableReport:
 		else:
 			entry_date = row.posting_date
 
+		row.range0 = 0.0
+
 		self.get_ageing_data(entry_date, row)
 
-		# ageing buckets should not have amounts if due date is not reached
 		if getdate(entry_date) > getdate(self.age_as_on):
+			row.range0 = row.outstanding
 			[setattr(row, f"range{i}", 0.0) for i in self.range_numbers]
+			row.total_due = 0
+			return
 
 		row.total_due = sum(row[f"range{i}"] for i in self.range_numbers)
 
@@ -1281,6 +1285,8 @@ class ReceivablePayableReport:
 		ranges = [*self.ranges, _("Above")]
 
 		prev_range_value = 0
+		self.add_column(label=_("<0"), fieldname="range0", fieldtype="Currency")
+		self.ageing_column_labels.append(_("<0"))
 		for idx, curr_range_value in enumerate(ranges):
 			label = f"{prev_range_value}-{curr_range_value}"
 			self.add_column(label=label, fieldname="range" + str(idx + 1))
@@ -1296,7 +1302,9 @@ class ReceivablePayableReport:
 		for row in self.data:
 			row = frappe._dict(row)
 			if not cint(row.bold):
-				values = [flt(row.get(f"range{i}", None), precision) for i in self.range_numbers]
+				values = [flt(row.get("range0", 0), precision)] + [
+					flt(row.get(f"range{i}", 0), precision) for i in self.range_numbers
+				]
 				rows.append({"values": values})
 
 		self.chart = {
@@ -1384,27 +1392,14 @@ class InitSQLProceduresForAR:
 		amount_in_account_currency {_currency_type}) engine=memory;
 	"""
 
-	# Function
-	genkey_function_name = "ar_genkey"
-	genkey_function_sql = f"""
-	create function `{genkey_function_name}`(rec row type of `{_row_def_table_name}`, allocate bool) returns char(40)
-	begin
-		if allocate then
-			return sha1(concat_ws(',', rec.account, rec.against_voucher_type, rec.against_voucher_no, rec.party));
-		else
-			return sha1(concat_ws(',', rec.account, rec.voucher_type, rec.voucher_no, rec.party));
-		end if;
-	end
-	"""
-
 	# Procedures
 	init_procedure_name = "ar_init_tmp_table"
 	init_procedure_sql = f"""
 	create procedure ar_init_tmp_table(in ple row type of `{_row_def_table_name}`)
 	begin
-		if not exists (select name from `{_voucher_balance_name}` where name = `{genkey_function_name}`(ple, false))
+		if not exists (select name from `{_voucher_balance_name}` where name = sha1(concat_ws(',', ple.account, ple.against_voucher_type, ple.against_voucher_no, ple.party)))
 		then
-			insert into `{_voucher_balance_name}` values (`{genkey_function_name}`(ple, false), ple.voucher_type, ple.voucher_no, ple.party, ple.account, ple.posting_date, ple.account_currency, ple.cost_center, 0, 0, 0, 0, 0, 0);
+			insert into `{_voucher_balance_name}` values (sha1(concat_ws(',', ple.account, ple.against_voucher_type, ple.against_voucher_no, ple.party)), ple.voucher_type, ple.voucher_no, ple.party, ple.account, ple.posting_date, ple.account_currency, ple.cost_center, 0, 0, 0, 0, 0, 0);
 		end if;
 	end;
 	"""
@@ -1446,15 +1441,12 @@ class InitSQLProceduresForAR:
 
 		end if;
 
-		insert into `{_voucher_balance_name}` values (`{genkey_function_name}`(ple, true), ple.against_voucher_type, ple.against_voucher_no, ple.party, ple.account, ple.posting_date, ple.account_currency,'', invoiced, paid, 0, invoiced_in_account_currency, paid_in_account_currency, 0);
+		insert into `{_voucher_balance_name}` values (sha1(concat_ws(',', ple.account, ple.voucher_type, ple.voucher_no, ple.party)), ple.against_voucher_type, ple.against_voucher_no, ple.party, ple.account, ple.posting_date, ple.account_currency,'', invoiced, paid, 0, invoiced_in_account_currency, paid_in_account_currency, 0);
 	end;
 	"""
 
 	def __init__(self):
 		existing_procedures = frappe.db.get_routines()
-
-		if self.genkey_function_name not in existing_procedures:
-			frappe.db.sql(self.genkey_function_sql)
 
 		if self.init_procedure_name not in existing_procedures:
 			frappe.db.sql(self.init_procedure_sql)

@@ -9,7 +9,7 @@ from frappe.desk.form.load import get_attachments
 from frappe.exceptions import QueryDeadlockError, QueryTimeoutError
 from frappe.model.document import Document
 from frappe.query_builder import DocType, Interval
-from frappe.query_builder.functions import Max, Now
+from frappe.query_builder.functions import CombineDatetime, Max, Now
 from frappe.utils import cint, get_link_to_form, get_weekday, getdate, now, nowtime
 from frappe.utils.user import get_users_with_role
 from rq.timeouts import JobTimeoutException
@@ -53,7 +53,7 @@ class RepostItemValuation(Document):
 		repost_only_accounting_ledgers: DF.Check
 		reposting_data_file: DF.Attach | None
 		reposting_reference: DF.Data | None
-		status: DF.Literal["Queued", "In Progress", "Completed", "Skipped", "Failed"]
+		status: DF.Literal["Queued", "In Progress", "Completed", "Skipped", "Failed", "Cancelled"]
 		total_reposting_count: DF.Int
 		via_landed_cost_voucher: DF.Check
 		voucher_no: DF.DynamicLink | None
@@ -72,6 +72,12 @@ class RepostItemValuation(Document):
 				& (table.status.isin(["Completed", "Skipped"]))
 			),
 		)
+
+	def on_discard(self):
+		self.db_set("status", "Cancelled")
+
+	def repost_now(self):
+		repost(self)
 
 	def validate(self):
 		self.reset_repost_only_accounting_ledgers()
@@ -284,6 +290,7 @@ class RepostItemValuation(Document):
 		"""Deduplicate similar reposts based on item-warehouse-posting combination."""
 
 		if self.repost_only_accounting_ledgers:
+			# If against same voucher there are multiple RIVs for accounting ledgers only, skip them
 			self.skipped_similar_reposts()
 			return
 
@@ -539,40 +546,89 @@ def get_recipients():
 	return recipients
 
 
+def run_parallel_reposting():
+	# This function is called every 15 minutes via hooks.py
+
+	if not frappe.db.get_single_value("Stock Reposting Settings", "enable_parallel_reposting"):
+		return
+
+	if not in_configured_timeslot():
+		return
+
+	items = set()
+	no_of_parallel_reposting = (
+		frappe.db.get_single_value("Stock Reposting Settings", "no_of_parallel_reposting") or 4
+	)
+
+	riv_entries = get_repost_item_valuation_entries()
+
+	for row in riv_entries:
+		if row.based_on != "Item and Warehouse" or row.repost_only_accounting_ledgers:
+			execute_reposting_entry(row.name)
+			continue
+
+		if row.item_code in items:
+			continue
+
+		items.add(row.item_code)
+		if len(items) > no_of_parallel_reposting:
+			break
+
+		frappe.enqueue(
+			execute_reposting_entry,
+			name=row.name,
+			queue="long",
+			timeout=1800,
+		)
+
+
 def repost_entries():
-	"""
-	Reposts 'Repost Item Valuation' entries in queue.
-	Called hourly via hooks.py.
-	"""
+	# This function is called every hour via hooks.py
+
+	if frappe.db.get_single_value("Stock Reposting Settings", "enable_parallel_reposting"):
+		return
+
 	if not in_configured_timeslot():
 		return
 
 	riv_entries = get_repost_item_valuation_entries()
 
 	for row in riv_entries:
-		doc = frappe.get_doc("Repost Item Valuation", row.name)
-		if (
-			doc.repost_only_accounting_ledgers
-			and doc.reposting_reference
-			and frappe.db.get_value("Repost Item Valuation", doc.reposting_reference, "status")
-			not in ["Completed", "Skipped"]
-		):
-			continue
+		execute_reposting_entry(row.name)
 
-		if doc.status in ("Queued", "In Progress"):
-			repost(doc)
-			doc.deduplicate_similar_repost()
+
+def execute_reposting_entry(name):
+	doc = frappe.get_doc("Repost Item Valuation", name)
+	if (
+		doc.repost_only_accounting_ledgers
+		and doc.reposting_reference
+		and frappe.db.get_value("Repost Item Valuation", doc.reposting_reference, "status")
+		not in ["Completed", "Skipped"]
+	):
+		return
+
+	if doc.status in ("Queued", "In Progress"):
+		repost(doc)
+		doc.deduplicate_similar_repost()
 
 
 def get_repost_item_valuation_entries():
-	return frappe.db.sql(
-		""" SELECT name from `tabRepost Item Valuation`
-		WHERE status in ('Queued', 'In Progress') and creation <= %s and docstatus = 1
-		ORDER BY timestamp(posting_date, posting_time) asc, creation asc, status asc
-	""",
-		now(),
-		as_dict=1,
+	doctype = frappe.qb.DocType("Repost Item Valuation")
+
+	query = (
+		frappe.qb.from_(doctype)
+		.select(doctype.name, doctype.based_on, doctype.item_code, doctype.repost_only_accounting_ledgers)
+		.where(
+			(doctype.status.isin(["Queued", "In Progress"]))
+			& (doctype.creation <= now())
+			& (doctype.docstatus == 1)
+		)
+		.orderby(CombineDatetime(doctype.posting_date, doctype.posting_time), order=frappe.qb.asc)
+		.orderby(doctype.creation, order=frappe.qb.asc)
+		.orderby(doctype.status, order=frappe.qb.asc)
 	)
+
+	return query.run(as_dict=True)
 
 
 def in_configured_timeslot(repost_settings=None, current_time=None):
@@ -601,9 +657,14 @@ def in_configured_timeslot(repost_settings=None, current_time=None):
 @frappe.whitelist()
 def execute_repost_item_valuation():
 	"""Execute repost item valuation via scheduler."""
+
+	method = "erpnext.stock.doctype.repost_item_valuation.repost_item_valuation.repost_entries"
+	if frappe.db.get_single_value("Stock Reposting Settings", "enable_parallel_reposting"):
+		method = "erpnext.stock.doctype.repost_item_valuation.repost_item_valuation.run_parallel_reposting"
+
 	if name := frappe.db.get_value(
 		"Scheduled Job Type",
-		{"method": "erpnext.stock.doctype.repost_item_valuation.repost_item_valuation.repost_entries"},
+		{"method": method},
 		"name",
 	):
 		frappe.get_doc("Scheduled Job Type", name).enqueue(force=True)

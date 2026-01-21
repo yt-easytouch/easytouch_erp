@@ -25,6 +25,7 @@ erpnext.accounts.SalesInvoiceController = class SalesInvoiceController extends (
 	company() {
 		super.company();
 		erpnext.accounts.dimensions.update_dimension(this.frm, this.frm.doctype);
+		this.frm.clear_table("tax_withholding_entries");
 	}
 	onload() {
 		var me = this;
@@ -114,15 +115,9 @@ erpnext.accounts.SalesInvoiceController = class SalesInvoiceController extends (
 			}
 
 			if (cint(doc.update_stock) != 1) {
-				// show Make Delivery Note button only if Sales Invoice is not created from Delivery Note
-				var from_delivery_note = false;
-				from_delivery_note = this.frm.doc.items.some(function (item) {
-					return item.delivery_note ? true : false;
-				});
-
-				if (!from_delivery_note && !is_delivered_by_supplier) {
+				if (!is_delivered_by_supplier) {
 					this.frm.add_custom_button(
-						__("Delivery"),
+						__("Delivery Note"),
 						this.frm.cscript["Make Delivery Note"],
 						__("Create")
 					);
@@ -382,6 +377,9 @@ erpnext.accounts.SalesInvoiceController = class SalesInvoiceController extends (
 				),
 			},
 			function () {
+				me.frm.doc.apply_tds =
+					me.frm.tax_withholding_category || me.frm.tax_withholding_group ? 1 : 0;
+				me.frm.clear_table("tax_withholding_entries");
 				me.apply_pricing_rule();
 			}
 		);
@@ -598,6 +596,10 @@ erpnext.accounts.SalesInvoiceController = class SalesInvoiceController extends (
 
 		this.calculate_taxes_and_totals();
 	}
+
+	apply_tds(frm) {
+		this.frm.clear_table("tax_withholding_entries");
+	}
 };
 
 // for backward compatibility: combine new and previous states
@@ -616,10 +618,6 @@ cur_frm.cscript.income_account = function (doc, cdt, cdn) {
 
 cur_frm.cscript.expense_account = function (doc, cdt, cdn) {
 	erpnext.utils.copy_value_in_all_rows(doc, cdt, cdn, "items", "expense_account");
-};
-
-cur_frm.cscript.cost_center = function (doc, cdt, cdn) {
-	erpnext.utils.copy_value_in_all_rows(doc, cdt, cdn, "items", "cost_center");
 };
 
 frappe.ui.form.on("Sales Invoice", {
@@ -818,6 +816,16 @@ frappe.ui.form.on("Sales Invoice", {
 	},
 	onload: function (frm) {
 		frm.redemption_conversion_factor = null;
+
+		if (frm.doc.__onload && frm.doc.customer) {
+			if (frm.is_new()) {
+				frm.doc.apply_tds = frm.doc.__onload.apply_tds ? 1 : 0;
+			}
+		}
+
+		if (frm.is_new()) {
+			frm.clear_table("tax_withholding_entries");
+		}
 	},
 
 	update_stock: function (frm, dt, dn) {

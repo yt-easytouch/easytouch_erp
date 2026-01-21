@@ -19,6 +19,20 @@ frappe.ui.form.on("BOM", {
 			};
 		});
 
+		frm.set_query("operation", "items", function () {
+			if (!frm.doc.operations?.length) {
+				frappe.throw(__("Please add Operations first."));
+			}
+
+			let operations = frm.doc.operations.map((d) => d.operation);
+
+			return {
+				filters: {
+					name: ["in", operations],
+				},
+			};
+		});
+
 		frm.set_query("bom_no", "operations", function (doc, cdt, cdn) {
 			let row = locals[cdt][cdn];
 			return {
@@ -78,6 +92,10 @@ frappe.ui.form.on("BOM", {
 			};
 		});
 
+		frm.events.set_company_filters(frm, "project");
+		frm.events.set_company_filters(frm, "default_source_warehouse");
+		frm.events.set_company_filters(frm, "default_target_warehouse");
+
 		frm.trigger("toggle_fields_for_semi_finished_goods");
 	},
 
@@ -88,6 +106,16 @@ frappe.ui.form.on("BOM", {
 				title: __("Mandatory"),
 			});
 		}
+	},
+
+	set_company_filters: function (frm, fieldname) {
+		frm.set_query(fieldname, () => {
+			return {
+				filters: {
+					company: frm.doc.company,
+				},
+			};
+		});
 	},
 
 	track_semi_finished_goods(frm) {
@@ -250,6 +278,7 @@ frappe.ui.form.on("BOM", {
 			});
 		}
 
+		frm.phantom_bom_filters.filters.is_stock_item = !frm.doc.is_phantom_bom;
 		if (frm.doc.is_phantom_bom) {
 			frm.phantom_bom_filters.filters.is_fixed_asset = 0;
 		} else {

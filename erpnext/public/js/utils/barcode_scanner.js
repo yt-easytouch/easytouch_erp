@@ -138,7 +138,6 @@ erpnext.utils.BarcodeScanner = class BarcodeScanner {
 
 			frappe.run_serially([
 				() => this.set_selector_trigger_flag(data),
-				() => this.set_barcode_uom(row, uom),
 				() => this.set_serial_no(row, serial_no),
 				() => this.set_batch_no(row, batch_no),
 				() => this.set_barcode(row, barcode),
@@ -148,6 +147,7 @@ erpnext.utils.BarcodeScanner = class BarcodeScanner {
 						this.show_scan_message(row.idx, !is_new_row, qty);
 					}),
 				() => this.clean_up(),
+				() => this.set_barcode_uom(row, uom),
 				() => this.revert_selector_flag(),
 				() => resolve(row),
 			]);
@@ -338,7 +338,7 @@ erpnext.utils.BarcodeScanner = class BarcodeScanner {
 			? this.dialog.get_value("serial_no").split("\n")
 			: [];
 
-		if (in_list(serial_nos, serial_no)) {
+		if (serial_nos.includes(serial_no)) {
 			frappe.throw(__("Serial No {0} already scanned", [serial_no]));
 		}
 	}
@@ -359,7 +359,7 @@ erpnext.utils.BarcodeScanner = class BarcodeScanner {
 			];
 
 			for (let key in prev_row) {
-				if (in_list(ignore_fields, key)) {
+				if (ignore_fields.includes(key)) {
 					continue;
 				}
 

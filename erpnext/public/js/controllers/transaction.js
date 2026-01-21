@@ -131,6 +131,15 @@ erpnext.TransactionController = class TransactionController extends erpnext.taxe
 			frm.cscript.calculate_taxes_and_totals();
 		});
 
+		// Tax Withholding Entries - Auto calculate withholding amount when taxable amount or tax rate changes
+		frappe.ui.form.on("Tax Withholding Entry", "taxable_amount", function (frm, cdt, cdn) {
+			me.calculate_withholding_amount(frm, cdt, cdn);
+		});
+
+		frappe.ui.form.on("Tax Withholding Entry", "tax_rate", function (frm, cdt, cdn) {
+			me.calculate_withholding_amount(frm, cdt, cdn);
+		});
+
 		frappe.ui.form.on(this.frm.doctype + " Item", {
 			items_add: function (frm, cdt, cdn) {
 				var item = frappe.get_doc(cdt, cdn);
@@ -509,7 +518,7 @@ erpnext.TransactionController = class TransactionController extends erpnext.taxe
 
 	barcode(doc, cdt, cdn) {
 		let row = locals[cdt][cdn];
-		if (row.barcode) {
+		if (row.barcode && !frappe.flags.trigger_from_barcode_scanner) {
 			erpnext.stock.utils.set_item_details_using_barcode(this.frm, row, (r) => {
 				frappe.model.set_value(cdt, cdn, {
 					item_code: r.message.item_code,
@@ -581,6 +590,18 @@ erpnext.TransactionController = class TransactionController extends erpnext.taxe
 				me.send_sms();
 			});
 		}
+	}
+
+	calculate_withholding_amount(frm, cdt, cdn) {
+		// Calculate withholding amount: taxable_amount * tax_rate / 100
+		let row = frappe.get_doc(cdt, cdn);
+		let withholding_amount = flt(
+			(row.taxable_amount * row.tax_rate) / 100,
+			precision("withholding_amount", row)
+		);
+
+		// Set the calculated withholding amount
+		frappe.model.set_value(cdt, cdn, "withholding_amount", withholding_amount);
 	}
 
 	send_sms() {
@@ -883,7 +904,7 @@ erpnext.TransactionController = class TransactionController extends erpnext.taxe
 	get_incoming_rate(item, posting_date, posting_time, voucher_type, company) {
 		let item_args = {
 			item_code: item.item_code,
-			warehouse: in_list("Purchase Receipt", "Purchase Invoice") ? item.from_warehouse : item.warehouse,
+			warehouse: item.warehouse,
 			posting_date: posting_date,
 			posting_time: posting_time,
 			qty: item.qty * item.conversion_factor,
@@ -924,11 +945,10 @@ erpnext.TransactionController = class TransactionController extends erpnext.taxe
 				// Replace all occurences of comma with line feed
 				item.serial_no = item.serial_no.replace(/,/g, "\n");
 				item.conversion_factor = item.conversion_factor || 1;
-				refresh_field("serial_no", item.name, item.parentfield);
 				if (!doc.is_return) {
 					setTimeout(() => {
 						me.update_qty(cdt, cdn);
-					}, 3000);
+					}, 300);
 				}
 			}
 		}
@@ -1241,12 +1261,8 @@ erpnext.TransactionController = class TransactionController extends erpnext.taxe
 		this.frm.refresh_field("payment_schedule");
 	}
 
-	cost_center(doc) {
-		this.frm.doc.items.forEach((item) => {
-			item.cost_center = doc.cost_center;
-		});
-
-		this.frm.refresh_field("items");
+	cost_center(doc, cdt, cdn) {
+		erpnext.utils.copy_value_in_all_rows(doc, cdt, cdn, "items", "cost_center");
 	}
 
 	due_date(doc, cdt, cdn) {
@@ -1513,8 +1529,8 @@ erpnext.TransactionController = class TransactionController extends erpnext.taxe
 		} else if (
 			this.frm.doc.price_list_currency === this.frm.doc.currency &&
 			this.frm.doc.plc_conversion_rate &&
-			cint(this.frm.doc.plc_conversion_rate) != 1 &&
-			cint(this.frm.doc.plc_conversion_rate) != cint(this.frm.doc.conversion_rate)
+			flt(this.frm.doc.plc_conversion_rate) != 1 &&
+			flt(this.frm.doc.plc_conversion_rate) != flt(this.frm.doc.conversion_rate)
 		) {
 			this.frm.set_value("conversion_rate", this.frm.doc.plc_conversion_rate);
 		}
@@ -2231,7 +2247,7 @@ erpnext.TransactionController = class TransactionController extends erpnext.taxe
 							child.apply_rule_on_other_items &&
 							JSON.parse(child.apply_rule_on_other_items).length
 						) {
-							if (!in_list(JSON.parse(child.apply_rule_on_other_items), child.item_code)) {
+							if (!JSON.parse(child.apply_rule_on_other_items).includes(child.item_code)) {
 								continue;
 							}
 						}
@@ -2279,7 +2295,7 @@ erpnext.TransactionController = class TransactionController extends erpnext.taxe
 					if (JSON.parse(data.apply_rule_on_other_items).includes(d[data.apply_rule_on])) {
 						for (var k in data) {
 							if (
-								in_list(fields, k) &&
+								fields.includes(k) &&
 								data[k] &&
 								(data.price_or_product_discount === "Price" || k === "pricing_rules")
 							) {
@@ -2751,8 +2767,7 @@ erpnext.TransactionController = class TransactionController extends erpnext.taxe
 	}
 
 	has_discount_in_schedule() {
-		let is_eligible = in_list(
-			["Sales Order", "Sales Invoice", "Purchase Order", "Purchase Invoice"],
+		let is_eligible = ["Sales Order", "Sales Invoice", "Purchase Order", "Purchase Invoice"].includes(
 			this.frm.doctype
 		);
 		let has_payment_schedule = this.frm.doc.payment_schedule && this.frm.doc.payment_schedule.length;
@@ -3188,16 +3203,13 @@ erpnext.show_serial_batch_selector = function (frm, item_row, callback, on_close
 			}
 
 			if (
-				in_list(
-					[
-						"Material Transfer",
-						"Send to Subcontractor",
-						"Material Issue",
-						"Material Consumption for Manufacture",
-						"Material Transfer for Manufacture",
-					],
-					frm.doc.purpose
-				)
+				[
+					"Material Transfer",
+					"Send to Subcontractor",
+					"Material Issue",
+					"Material Consumption for Manufacture",
+					"Material Transfer for Manufacture",
+				].includes(frm.doc.purpose)
 			) {
 				warehouse_field = "s_warehouse";
 			} else {

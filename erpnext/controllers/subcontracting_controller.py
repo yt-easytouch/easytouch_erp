@@ -221,7 +221,7 @@ class SubcontractingController(StockController):
 			and self._doc_before_save
 		):
 			for row in self._doc_before_save.get("items"):
-				item_dict[row.name] = (row.item_code, row.qty)
+				item_dict[row.name] = (row.item_code, row.qty + (row.get("rejected_qty") or 0))
 
 		return item_dict
 
@@ -245,7 +245,10 @@ class SubcontractingController(StockController):
 
 		for row in self.items:
 			self.__reference_name.append(row.name)
-			if (row.name not in item_dict) or (row.item_code, row.qty) != item_dict[row.name]:
+			if (row.name not in item_dict) or (
+				row.item_code,
+				row.qty + (row.get("rejected_qty") or 0),
+			) != item_dict[row.name]:
 				self.__changed_name.append(row.name)
 
 			if item_dict.get(row.name):
@@ -607,7 +610,9 @@ class SubcontractingController(StockController):
 			and self.doctype != "Subcontracting Inward Order"
 		):
 			row.reserve_warehouse = self.set_reserve_warehouse or item.warehouse
-		elif frappe.get_cached_value("Item", row.rm_item_code, "is_customer_provided_item"):
+		elif frappe.get_cached_value("Item", row.rm_item_code, "is_customer_provided_item") and self.get(
+			"customer_warehouse"
+		):
 			row.warehouse = self.customer_warehouse
 
 	def __set_alternative_item(self, bom_item):
@@ -725,7 +730,6 @@ class SubcontractingController(StockController):
 				self.set_batch_for_supplied_items()
 
 	def set_batch_for_supplied_items(self):
-		from erpnext.stock.doctype.serial_no.serial_no import get_serial_nos_for_outward
 		from erpnext.stock.get_item_details import get_filtered_serial_nos
 
 		if self.is_return:
@@ -934,7 +938,11 @@ class SubcontractingController(StockController):
 				for bom_item in self._get_materials_from_bom(
 					row.item_code, row.bom, row.get("include_exploded_items")
 				):
-					qty = flt(bom_item.qty_consumed_per_unit) * flt(row.qty) * row.conversion_factor
+					qty = (
+						flt(bom_item.qty_consumed_per_unit)
+						* flt(row.qty + (row.get("rejected_qty") or 0))
+						* row.conversion_factor
+					)
 					bom_item.main_item_code = row.item_code
 					self.__update_reserve_warehouse(bom_item, row)
 					self.__set_alternative_item(bom_item)
@@ -1394,6 +1402,7 @@ def make_rm_stock_entry(
 
 			stock_entry.set_stock_entry_type()
 
+			over_transfer_allowance = frappe.get_single_value("Buying Settings", "over_transfer_allowance")
 			for fg_item_code in fg_item_code_list:
 				for rm_item in rm_items:
 					if (
@@ -1401,14 +1410,27 @@ def make_rm_stock_entry(
 						or rm_item.get("item_code") == fg_item_code
 					):
 						rm_item_code = rm_item.get("rm_item_code")
+						qty = rm_item.get("qty") or max(
+							rm_item.get("required_qty") - rm_item.get("total_supplied_qty"), 0
+						)
+						if qty <= 0 and rm_item.get("total_supplied_qty"):
+							per_transferred = (
+								flt(
+									rm_item.get("total_supplied_qty") / rm_item.get("required_qty"),
+									frappe.db.get_default("float_precision"),
+								)
+								* 100
+							)
+							if per_transferred >= 100 + over_transfer_allowance:
+								continue
+
 						items_dict = {
 							rm_item_code: {
 								rm_detail_field: rm_item.get("name"),
 								"item_name": rm_item.get("item_name")
 								or item_wh.get(rm_item_code, {}).get("item_name", ""),
 								"description": item_wh.get(rm_item_code, {}).get("description", ""),
-								"qty": rm_item.get("qty")
-								or max(rm_item.get("required_qty") - rm_item.get("total_supplied_qty"), 0),
+								"qty": qty,
 								"from_warehouse": rm_item.get("warehouse")
 								or rm_item.get("reserve_warehouse"),
 								"to_warehouse": subcontract_order.supplier_warehouse,

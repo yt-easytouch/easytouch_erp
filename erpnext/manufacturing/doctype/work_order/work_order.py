@@ -180,6 +180,9 @@ class WorkOrder(Document):
 
 		return False
 
+	def on_discard(self):
+		self.db_set("status", "Cancelled")
+
 	def validate(self):
 		self.validate_production_item()
 		if self.bom_no:
@@ -499,8 +502,8 @@ class WorkOrder(Document):
 	def validate_work_order_against_so(self):
 		# already ordered qty
 		ordered_qty_against_so = frappe.db.sql(
-			"""select sum(qty) from `tabWork Order`
-			where production_item = %s and sales_order = %s and docstatus < 2 and status != 'Closed' and name != %s""",
+			"""select sum(qty - process_loss_qty) from `tabWork Order`
+			where production_item = %s and sales_order = %s and docstatus = 1 and status != 'Closed' and name != %s""",
 			(self.production_item, self.sales_order, self.name),
 		)[0][0]
 
@@ -509,13 +512,13 @@ class WorkOrder(Document):
 		# get qty from Sales Order Item table
 		so_item_qty = frappe.db.sql(
 			"""select sum(stock_qty) from `tabSales Order Item`
-			where parent = %s and item_code = %s""",
+			where parent = %s and item_code = %s and docstatus = 1""",
 			(self.sales_order, self.production_item),
 		)[0][0]
 		# get qty from Packing Item table
 		dnpi_qty = frappe.db.sql(
 			"""select sum(qty) from `tabPacked Item`
-			where parent = %s and parenttype = 'Sales Order' and item_code = %s""",
+			where parent = %s and parenttype = 'Sales Order' and item_code = %s and docstatus = 1""",
 			(self.sales_order, self.production_item),
 		)[0][0]
 		# total qty in SO
@@ -527,23 +530,26 @@ class WorkOrder(Document):
 
 		if total_qty > so_qty + (allowance_percentage / 100 * so_qty):
 			frappe.throw(
-				_("Cannot produce more Item {0} than Sales Order quantity {1}").format(
-					self.production_item, so_qty
+				_("Cannot produce more Item {0} than Sales Order quantity {1} {2}").format(
+					get_link_to_form("Item", self.production_item),
+					frappe.bold(so_qty),
+					frappe.bold(frappe.get_value("Item", self.production_item, "stock_uom")),
 				),
 				OverProductionError,
 			)
 
 	def update_status(self, status=None):
 		"""Update status of work order if unknown"""
-		if status != "Stopped" and status != "Closed":
-			status = self.get_status(status)
+		if self.status != "Closed":
+			if status not in ["Stopped", "Closed"]:
+				status = self.get_status(status)
 
-		if status != self.status:
-			self.db_set("status", status)
+			if status != self.status:
+				self.db_set("status", status)
 
-		self.update_required_items()
+			self.update_required_items()
 
-		return status
+		return status or self.status
 
 	def get_status(self, status=None):
 		"""Return the status based on stock entries against this work order"""
@@ -572,9 +578,9 @@ class WorkOrder(Document):
 		):
 			status = "In Process"
 
-		if self.track_semi_finished_goods and status != "Completed":
-			if op_status := self.get_status_based_on_operation():
-				status = op_status
+		if status != "Completed":
+			if not all(d.status == "Pending" for d in self.operations):
+				status = "In Process"
 
 		if status == "Not Started" and self.reserve_stock:
 			for row in self.required_items:
@@ -588,11 +594,6 @@ class WorkOrder(Document):
 					break
 
 		return status
-
-	def get_status_based_on_operation(self):
-		for row in self.operations:
-			if row.status != "Completed":
-				return "In Process"
 
 	def update_work_order_qty(self):
 		"""Update **Manufactured Qty** and **Material Transferred for Qty** in Work Order
@@ -769,6 +770,7 @@ class WorkOrder(Document):
 		self.db_set("status", "Cancelled")
 
 		self.on_close_or_cancel()
+		self.delete_job_card()
 
 	def on_close_or_cancel(self):
 		if self.production_plan and frappe.db.exists(
@@ -778,7 +780,6 @@ class WorkOrder(Document):
 		else:
 			self.update_work_order_qty_in_so()
 
-		self.delete_job_card()
 		self.update_completed_qty_in_material_request()
 		self.update_planned_qty()
 		self.update_ordered_qty()
@@ -2570,6 +2571,8 @@ def create_job_card(work_order, row, enable_capacity_planning=False, auto_create
 		work_order.transfer_material_against == "Job Card" and not work_order.skip_transfer
 	):
 		doc.get_required_items()
+		if work_order.track_semi_finished_goods:
+			doc.set_scrap_items()
 
 	if auto_create:
 		doc.flags.ignore_mandatory = True

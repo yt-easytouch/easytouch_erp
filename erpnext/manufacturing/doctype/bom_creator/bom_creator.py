@@ -4,7 +4,7 @@
 from collections import OrderedDict
 
 import frappe
-from frappe import _
+from frappe import _, bold
 from frappe.model.document import Document
 from frappe.utils import cint, flt, sbool
 from pypika.terms import ValueWrapper
@@ -78,6 +78,29 @@ class BOMCreator(Document):
 
 	def validate(self):
 		self.validate_items()
+		self.validate_duplicate_item()
+
+	def validate_duplicate_item(self):
+		# If same items added multiple times under same parent, raise error
+		item_map = {}
+		for row in self.items:
+			if not row.fg_reference_id:
+				continue
+
+			key = (row.item_code, row.fg_reference_id)
+			if key in item_map:
+				parent_item_code = next(
+					item.item_code for item in self.items if item.name == row.fg_reference_id
+				)
+
+				frappe.throw(
+					_(
+						"Item {0} added multiple times under the same parent item {1} at rows {2} and {3}"
+					).format(bold(row.item_code), bold(parent_item_code), item_map[key], row.idx),
+					title=_("Duplicate Item Under Same Parent"),
+				)
+			else:
+				item_map[key] = row.idx
 
 	def validate_items(self):
 		for row in self.items:
@@ -126,10 +149,6 @@ class BOMCreator(Document):
 	def on_cancel(self):
 		self.set_status(True)
 
-	def set_conversion_factor(self):
-		for row in self.items:
-			row.conversion_factor = 1.0
-
 	def before_submit(self):
 		self.validate_fields()
 		self.set_status()
@@ -160,10 +179,11 @@ class BOMCreator(Document):
 		amount = self.get_raw_material_cost()
 		self.raw_material_cost = amount
 
-	def get_raw_material_cost(self, fg_item=None, amount=0):
+	def get_raw_material_cost(self, fg_item=None):
 		if not fg_item:
 			fg_item = self.item_code
 
+		amount = 0
 		for row in self.items:
 			if row.fg_item != fg_item:
 				continue
@@ -182,14 +202,10 @@ class BOMCreator(Document):
 					},
 					self,
 				)
-
-				row.amount = flt(row.rate) * flt(row.qty)
-
 			else:
-				row.amount = 0.0
-				row.amount = self.get_raw_material_cost(row.item_code, row.amount)
-				row.rate = flt(row.amount) / (flt(row.qty) * flt(row.conversion_factor))
+				row.rate = flt(self.get_raw_material_cost(row.item_code) * row.conversion_factor)
 
+			row.amount = flt(row.rate) * flt(row.qty)
 			amount += flt(row.amount)
 
 		return amount
@@ -200,6 +216,11 @@ class BOMCreator(Document):
 			row.is_expandable = 0
 			if row.item_code in fg_items:
 				row.is_expandable = 1
+
+	def set_conversion_factor(self):
+		for row in self.items:
+			if not row.conversion_factor:
+				row.conversion_factor = 1.0
 
 	def validate_fields(self):
 		fields = {

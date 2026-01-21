@@ -116,6 +116,11 @@ frappe.ui.form.on("Item", {
 				},
 				__("View")
 			);
+
+			frm.toggle_display(
+				["opening_stock"],
+				frappe.model.can_create("Stock Entry") && frappe.model.can_write("Stock Entry")
+			);
 		}
 
 		if (frm.doc.is_fixed_asset) {
@@ -129,7 +134,7 @@ frappe.ui.form.on("Item", {
 		if (frm.doc.has_variants) {
 			frm.set_intro(
 				__(
-					"This Item is a Template and cannot be used in transactions. Item attributes will be copied over into the variants unless 'No Copy' is set"
+					"This Item is a Template and cannot be used in transactions.<br>All fields present in the 'Copy Fields to Variant' table in Item Variant Settings will be copied to its variant items."
 				),
 				true
 			);
@@ -239,6 +244,8 @@ frappe.ui.form.on("Item", {
 				},
 			};
 		});
+
+		frm.toggle_display(["standard_rate"], frappe.model.can_create("Item Price"));
 	},
 
 	validate: function (frm) {
@@ -1063,7 +1070,7 @@ frappe.tour["Item"] = [
 		fieldname: "valuation_rate",
 		title: "Valuation Rate",
 		description: __(
-			"There are two options to maintain valuation of stock. FIFO (first in - first out) and Moving Average. To understand this topic in detail please visit <a href='https://docs.erpnext.com/docs/v13/user/manual/en/stock/articles/item-valuation-fifo-and-moving-average' target='_blank'>Item Valuation, FIFO and Moving Average.</a>"
+			"There are two options to maintain valuation of stock. FIFO (first in - first out) and Moving Average. To understand this topic in detail please visit <a href='https://docs.frappe.io/erpnext/user/manual/en/calculation-of-valuation-rate-in-fifo-and-moving-average' target='_blank'>Item Valuation, FIFO and Moving Average.</a>"
 		),
 	},
 	{
@@ -1089,9 +1096,9 @@ function open_form(frm, doctype, child_doctype, parentfield) {
 		let new_child_doc = frappe.model.add_child(new_doc, child_doctype, parentfield);
 		new_child_doc.item_code = frm.doc.name;
 		new_child_doc.item_name = frm.doc.item_name;
-		if (in_list(SALES_DOCTYPES, doctype) && frm.doc.sales_uom) {
+		if (SALES_DOCTYPES.includes(doctype) && frm.doc.sales_uom) {
 			new_child_doc.uom = frm.doc.sales_uom;
-		} else if (in_list(PURCHASE_DOCTYPES, doctype) && frm.doc.purchase_uom) {
+		} else if (PURCHASE_DOCTYPES.includes(doctype) && frm.doc.purchase_uom) {
 			new_child_doc.uom = frm.doc.purchase_uom;
 		} else {
 			new_child_doc.uom = frm.doc.stock_uom;

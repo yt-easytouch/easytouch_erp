@@ -17,13 +17,6 @@ frappe.ui.form.on("Purchase Receipt", {
 			"Landed Cost Voucher": "Landed Cost Voucher",
 		};
 
-		frm.set_query("expense_account", "items", function () {
-			return {
-				query: "erpnext.controllers.queries.get_expense_account",
-				filters: { company: frm.doc.company },
-			};
-		});
-
 		frm.set_query("wip_composite_asset", "items", function () {
 			return {
 				filters: { is_composite_asset: 1, docstatus: 0 },
@@ -171,6 +164,16 @@ erpnext.stock.PurchaseReceiptController = class PurchaseReceiptController extend
 		this.setup_accounting_dimension_triggers();
 		this.setup_posting_date_time_check();
 		super.setup(doc);
+
+		this.frm.set_query("expense_account", "items", () => {
+			return {
+				query: "erpnext.controllers.queries.get_expense_account",
+				filters: {
+					company: this.frm.doc.company,
+					disabled: 0,
+				},
+			};
+		});
 	}
 
 	refresh() {
@@ -263,7 +266,7 @@ erpnext.stock.PurchaseReceiptController = class PurchaseReceiptController extend
 					);
 				}
 				cur_frm.add_custom_button(
-					__("Retention Stock Entry"),
+					__("Sample Retention Stock Entry"),
 					this.make_retention_stock_entry,
 					__("Create")
 				);
