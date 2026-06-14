@@ -510,14 +510,7 @@ class PurchaseReceipt(BuyingController):
 				else flt(item.net_amount, item.precision("net_amount"))
 			)
 
-			outgoing_amount = (
-				flt((item.base_net_amount / item.received_qty) * item.qty, item.precision("base_net_amount"))
-				if item.received_qty
-				and frappe.get_single_value(
-					"Buying Settings", "bill_for_rejected_quantity_in_purchase_invoice"
-				)
-				else item.base_net_amount
-			)
+			outgoing_amount = item.base_net_amount
 			if self.is_internal_transfer() and item.valuation_rate:
 				outgoing_amount = abs(get_stock_value_difference(self.name, item.name, item.from_warehouse))
 				credit_amount = outgoing_amount
@@ -1257,7 +1250,7 @@ def get_billed_qty_amount_against_purchase_receipt(pr_doc):
 		.on(parent_table.name == table.parent)
 		.select(
 			table.pr_detail,
-			fn.Sum(table.amount * parent_table.conversion_rate).as_("amount"),
+			fn.Sum(table.base_net_amount).as_("amount"),
 			fn.Sum(table.qty).as_("qty"),
 		)
 		.where((table.pr_detail.isin(pr_names)) & (table.docstatus == 1))
@@ -1303,7 +1296,7 @@ def get_billed_qty_amount_against_purchase_order(pr_doc):
 			.select(
 				table.po_detail,
 				fn.Sum(table.qty).as_("qty"),
-				fn.Sum(table.amount * parent_table.conversion_rate).as_("amount"),
+				fn.Sum(table.base_net_amount).as_("amount"),
 			)
 			.where((table.po_detail.isin(po_names)) & (table.docstatus == 1) & (table.pr_detail.isnull()))
 			.groupby(table.po_detail)

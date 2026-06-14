@@ -26,7 +26,7 @@ frappe.ui.form.on("Sales Order", {
 			let color;
 			if (!doc.qty && frm.doc.has_unit_price_items) {
 				color = "yellow";
-			} else if (doc.stock_qty <= doc.actual_qty) {
+			} else if (doc.stock_qty - doc.delivered_qty <= doc.actual_qty) {
 				color = "green";
 			} else {
 				color = "orange";
@@ -776,7 +776,7 @@ erpnext.selling.SalesOrderController = class SalesOrderController extends erpnex
 					if (frappe.boot.user.in_create.includes("Payment Request")) {
 						this.frm.add_custom_button(
 							__("Payment Request"),
-							() => this.make_payment_request_with_schedule(),
+							() => this.make_payment_request(),
 							__("Create")
 						);
 					}
