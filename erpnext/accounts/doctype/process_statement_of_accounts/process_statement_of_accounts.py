@@ -390,7 +390,6 @@ def get_context(customer, doc):
 	return {
 		"doc": template_doc,
 		"customer": frappe.get_doc("Customer", customer),
-		"frappe": frappe.utils,
 	}
 
 
@@ -440,6 +439,8 @@ def get_customer_emails(customer_name, primary_mandatory, billing_and_primary=Tr
 	when Is Billing Contact checked
 	and Primary email- email with Is Primary checked"""
 
+	frappe.has_permission("Customer", "read", customer_name, throw=True)
+
 	billing_email = frappe.db.sql(
 		"""
 		SELECT
@@ -483,6 +484,7 @@ def get_customer_emails(customer_name, primary_mandatory, billing_and_primary=Tr
 @frappe.whitelist()
 def download_statements(document_name):
 	doc = frappe.get_doc("Process Statement Of Accounts", document_name)
+	doc.check_permission("read")
 	report = get_report_pdf(doc)
 	if report:
 		frappe.local.response.filename = doc.name + ".pdf"
@@ -493,6 +495,7 @@ def download_statements(document_name):
 @frappe.whitelist()
 def send_emails(document_name, from_scheduler=False, posting_date=None):
 	doc = frappe.get_doc("Process Statement Of Accounts", document_name)
+	doc.check_permission()
 	report = get_report_pdf(doc, consolidated=False)
 
 	if report:

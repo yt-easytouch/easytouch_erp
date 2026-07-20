@@ -61,6 +61,9 @@ before_install = [
 ]
 after_install = "erpnext.setup.install.after_install"
 
+after_app_install = "erpnext.setup.install.after_app_install"
+after_app_uninstall = "erpnext.setup.install.after_app_uninstall"
+
 boot_session = "erpnext.startup.boot.boot_session"
 notification_config = "erpnext.startup.notifications.get_notification_config"
 get_help_messages = "erpnext.utilities.activation.get_help_messages"
@@ -354,6 +357,9 @@ doc_events = {
 	},
 	"Event": {
 		"after_insert": "erpnext.crm.utils.link_events_with_prospect",
+	},
+	"Contact Us Settings": {
+		"on_update": "erpnext.crm.utils.disable_opportunity_creation_on_contact_us_disabled",
 	},
 	"Sales Invoice": {
 		"on_submit": [
