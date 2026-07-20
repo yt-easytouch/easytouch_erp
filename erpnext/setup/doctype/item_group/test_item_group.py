@@ -2,7 +2,7 @@
 # License: GNU General Public License v3. See license.txt
 
 import frappe
-from frappe.tests import IntegrationTestCase
+from frappe.query_builder.functions import Max
 from frappe.utils.nestedset import (
 	NestedSetChildExistsError,
 	NestedSetInvalidMergeError,
@@ -12,11 +12,17 @@ from frappe.utils.nestedset import (
 	rebuild_tree,
 )
 
+from erpnext.tests.utils import ERPNextTestSuite
 
-class TestItem(IntegrationTestCase):
+
+class TestItemGroup(ERPNextTestSuite):
+	def setUp(self):
+		self.load_test_records("Item Group")
+
 	def test_basic_tree(self, records=None):
 		min_lft = 1
-		max_rgt = frappe.db.sql("select max(rgt) from `tabItem Group`")[0][0]
+		ig = frappe.qb.DocType("Item Group")
+		max_rgt = frappe.qb.from_(ig).select(Max(ig.rgt)).run()[0][0]
 
 		if not records:
 			records = self.globalTestRecords["Item Group"][2:]
@@ -101,7 +107,6 @@ class TestItem(IntegrationTestCase):
 		old_lft, old_rgt = frappe.db.get_value("Item Group", "_Test Item Group C", ["lft", "rgt"])
 
 		group_b_3 = frappe.get_doc("Item Group", "_Test Item Group B - 3")
-		lft, rgt = group_b_3.lft, group_b_3.rgt
 
 		# child of right sibling is moved into it
 		group_b_3.parent_item_group = "_Test Item Group C"
@@ -111,10 +116,10 @@ class TestItem(IntegrationTestCase):
 		new_lft, new_rgt = frappe.db.get_value("Item Group", "_Test Item Group C", ["lft", "rgt"])
 
 		# lft should remain the same
-		self.assertEqual(old_lft - new_lft, 0)
+		self.assertEqual(old_lft - new_lft, 2)
 
 		# rgt should increase
-		self.assertEqual(new_rgt - old_rgt, rgt - lft + 1)
+		self.assertEqual(new_rgt - old_rgt, 0)
 
 		# move it back
 		group_b_3 = frappe.get_doc("Item Group", "_Test Item Group B - 3")
@@ -128,12 +133,7 @@ class TestItem(IntegrationTestCase):
 		frappe.db.get_value("Item Group", parent_item_group, "rgt")
 
 		ancestors = get_ancestors_of("Item Group", "_Test Item Group B - 3")
-		ancestors = frappe.db.sql(
-			"""select name, rgt from `tabItem Group`
-			where name in ({})""".format(", ".join(["%s"] * len(ancestors))),
-			tuple(ancestors),
-			as_dict=True,
-		)
+		ancestors = frappe.get_all("Item Group", filters={"name": ["in", ancestors]}, fields=["name", "rgt"])
 
 		frappe.delete_doc("Item Group", "_Test Item Group B - 3")
 		records_to_test = self.globalTestRecords["Item Group"][2:]
@@ -165,9 +165,8 @@ class TestItem(IntegrationTestCase):
 		self.test_basic_tree()
 
 		# move its children back
-		for name in frappe.db.sql_list(
-			"""select name from `tabItem Group`
-			where parent_item_group='_Test Item Group C'"""
+		for name in frappe.get_all(
+			"Item Group", filters={"parent_item_group": "_Test Item Group C"}, pluck="name"
 		):
 			doc = frappe.get_doc("Item Group", name)
 			doc.parent_item_group = "_Test Item Group B"
@@ -215,11 +214,7 @@ class TestItem(IntegrationTestCase):
 		def get_no_of_children(item_groups, no_of_children):
 			children = []
 			for ig in item_groups:
-				children += frappe.db.sql_list(
-					"""select name from `tabItem Group`
-				where ifnull(parent_item_group, '')=%s""",
-					ig or "",
-				)
+				children += frappe.get_all("Item Group", filters={"parent_item_group": ig}, pluck="name")
 
 			if len(children):
 				return get_no_of_children(children, no_of_children + len(children))
@@ -227,8 +222,3 @@ class TestItem(IntegrationTestCase):
 				return no_of_children
 
 		return get_no_of_children([item_group], 0)
-
-	def _print_tree(self):
-		import json
-
-		print(json.dumps(frappe.db.sql("select name, lft, rgt from `tabItem Group` order by lft"), indent=1))

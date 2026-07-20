@@ -2,16 +2,16 @@
 # License: GNU General Public License v3. See license.txt
 
 import frappe
-from frappe.tests import IntegrationTestCase
 
 import erpnext
 from erpnext.accounts.doctype.account.test_account import create_account
 from erpnext.stock.doctype.item.test_item import create_item
 from erpnext.stock.doctype.stock_entry.stock_entry_utils import make_stock_entry
 from erpnext.stock.doctype.warehouse.warehouse import convert_to_group_or_ledger, get_children
+from erpnext.tests.utils import ERPNextTestSuite
 
 
-class TestWarehouse(IntegrationTestCase):
+class TestWarehouse(ERPNextTestSuite):
 	def test_parent_warehouse(self):
 		parent_warehouse = frappe.get_doc("Warehouse", "_Test Warehouse Group - _TC")
 		self.assertEqual(parent_warehouse.is_group, 1)
@@ -19,11 +19,10 @@ class TestWarehouse(IntegrationTestCase):
 	def test_warehouse_hierarchy(self):
 		p_warehouse = frappe.get_doc("Warehouse", "_Test Warehouse Group - _TC")
 
-		child_warehouses = frappe.db.sql(
-			"""select name, is_group, parent_warehouse from `tabWarehouse` wh
-			where wh.lft > %s and wh.rgt < %s""",
-			(p_warehouse.lft, p_warehouse.rgt),
-			as_dict=1,
+		child_warehouses = frappe.get_all(
+			"Warehouse",
+			filters={"lft": [">", p_warehouse.lft], "rgt": ["<", p_warehouse.rgt]},
+			fields=["name", "is_group", "parent_warehouse"],
 		)
 
 		for child_warehouse in child_warehouses:

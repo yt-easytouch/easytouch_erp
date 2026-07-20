@@ -2,33 +2,18 @@
 # License: GNU General Public License v3. See license.txt
 
 import frappe
-from frappe.tests import IntegrationTestCase
-from frappe.utils import today
+from frappe.utils import flt, today
 
 from erpnext.accounts.doctype.payment_entry.payment_entry import get_payment_entry
 from erpnext.accounts.report.sales_payment_summary.sales_payment_summary import (
 	get_mode_of_payment_details,
 	get_mode_of_payments,
+	get_pos_invoice_data,
 )
+from erpnext.tests.utils import ERPNextTestSuite
 
-EXTRA_TEST_RECORD_DEPENDENCIES = ["Sales Invoice"]
 
-
-class TestSalesPaymentSummary(IntegrationTestCase):
-	@classmethod
-	def setUpClass(cls):
-		super().setUpClass()
-		create_records()
-		pes = frappe.get_all("Payment Entry")
-		jes = frappe.get_all("Journal Entry")
-		sis = frappe.get_all("Sales Invoice")
-		for pe in pes:
-			frappe.db.set_value("Payment Entry", pe.name, "docstatus", 2)
-		for je in jes:
-			frappe.db.set_value("Journal Entry", je.name, "docstatus", 2)
-		for si in sis:
-			frappe.db.set_value("Sales Invoice", si.name, "docstatus", 2)
-
+class TestSalesPaymentSummary(ERPNextTestSuite):
 	def test_get_mode_of_payments(self):
 		filters = get_filters()
 
@@ -52,8 +37,8 @@ class TestSalesPaymentSummary(IntegrationTestCase):
 			pe.submit()
 
 		mop = get_mode_of_payments(filters)
-		self.assertTrue("Credit Card" in next(iter(mop.values())))
-		self.assertTrue("Cash" in next(iter(mop.values())))
+		self.assertIn("Credit Card", next(iter(mop.values())))
+		self.assertIn("Cash", next(iter(mop.values())))
 
 		# Cancel all Cash payment entry and check if this mode of payment is still fetched.
 		payment_entries = frappe.get_all(
@@ -66,8 +51,8 @@ class TestSalesPaymentSummary(IntegrationTestCase):
 			pe.cancel()
 
 		mop = get_mode_of_payments(filters)
-		self.assertTrue("Credit Card" in next(iter(mop.values())))
-		self.assertTrue("Cash" not in next(iter(mop.values())))
+		self.assertIn("Credit Card", next(iter(mop.values())))
+		self.assertNotIn("Cash", next(iter(mop.values())))
 
 	def test_get_mode_of_payments_details(self):
 		filters = get_filters()
@@ -94,6 +79,7 @@ class TestSalesPaymentSummary(IntegrationTestCase):
 		mopd = get_mode_of_payment_details(filters)
 
 		mopd_values = next(iter(mopd.values()))
+		cc_init_amount = 0
 		for mopd_value in mopd_values:
 			if mopd_value[0] == "Credit Card":
 				cc_init_amount = mopd_value[1]
@@ -110,11 +96,39 @@ class TestSalesPaymentSummary(IntegrationTestCase):
 
 		mopd = get_mode_of_payment_details(filters)
 		mopd_values = next(iter(mopd.values()))
+		cc_final_amount = 0
 		for mopd_value in mopd_values:
 			if mopd_value[0] == "Credit Card":
 				cc_final_amount = mopd_value[1]
 
-		self.assertTrue(cc_init_amount > cc_final_amount)
+		self.assertGreater(cc_init_amount, cc_final_amount)
+
+	def test_get_pos_invoice_data(self):
+		"""The POS path (is_pos filter -> get_pos_invoice_data) used nested loose-GROUP-BY subqueries
+		that raised on Postgres; it now aggregates deterministically and runs identically on both
+		engines."""
+		si = create_sales_invoice_record()
+		si.is_pos = 1
+		si.append(
+			"payments",
+			{"mode_of_payment": "Cash", "account": "_Test Cash - _TC", "amount": 10000},
+		)
+		si.insert()
+		si.submit()
+
+		filters = frappe._dict(
+			{"is_pos": 1, "company": "_Test Company", "from_date": today(), "to_date": today()}
+		)
+		data = get_pos_invoice_data(filters)
+
+		# the POS invoice's paid amount is aggregated; previously this query raised GroupingError on PG
+		self.assertTrue(data)
+		self.assertTrue(any(flt(row.get("paid_amount")) >= 10000 for row in data))
+
+		# customer filter must work: a.customer was not selected by the invoice subquery before the fix,
+		# so the filter errored on both engines. With the invoice's customer it still returns its payment.
+		filters["customer"] = si.customer
+		self.assertTrue(any(flt(row.get("paid_amount")) >= 10000 for row in get_pos_invoice_data(filters)))
 
 
 def get_filters():
@@ -147,41 +161,3 @@ def create_sales_invoice_record(qty=1):
 			],
 		}
 	)
-
-
-def create_records():
-	if frappe.db.exists("Customer", "Prestiga-Biz"):
-		return
-
-	# customer
-	frappe.get_doc(
-		{
-			"customer_group": "_Test Customer Group",
-			"customer_name": "Prestiga-Biz",
-			"customer_type": "Company",
-			"doctype": "Customer",
-			"territory": "_Test Territory",
-		}
-	).insert()
-
-	# item
-	item = frappe.get_doc(
-		{
-			"doctype": "Item",
-			"item_code": "Consulting",
-			"item_name": "Consulting",
-			"item_group": "All Item Groups",
-			"company": "_Test Company",
-			"is_stock_item": 0,
-		}
-	).insert()
-
-	# item price
-	frappe.get_doc(
-		{
-			"doctype": "Item Price",
-			"price_list": "Standard Selling",
-			"item_code": item.item_code,
-			"price_list_rate": 10000,
-		}
-	).insert()

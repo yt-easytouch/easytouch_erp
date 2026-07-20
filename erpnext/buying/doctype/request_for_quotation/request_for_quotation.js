@@ -100,6 +100,7 @@ frappe.ui.form.on("Request for Quotation", {
 								fieldname: "print_format",
 								options: "Print Format",
 								placeholder: "Standard",
+								default: frappe.get_meta("Request for Quotation").default_print_format || "",
 								get_query: () => {
 									return {
 										filters: {
@@ -165,14 +166,10 @@ frappe.ui.form.on("Request for Quotation", {
 	},
 
 	show_supplier_quotation_comparison(frm) {
-		const today = new Date();
-		const oneMonthAgo = new Date(today);
-		oneMonthAgo.setMonth(today.getMonth() - 1);
-
 		frappe.route_options = {
 			company: frm.doc.company,
-			from_date: moment(oneMonthAgo).format("YYYY-MM-DD"),
-			to_date: moment(today).format("YYYY-MM-DD"),
+			from_date: moment(frm.doc.transaction_date).format("YYYY-MM-DD"),
+			to_date: moment(new Date()).format("YYYY-MM-DD"),
 			request_for_quotation: frm.doc.name,
 		};
 		frappe.set_route("query-report", "Supplier Quotation Comparison");
@@ -212,7 +209,7 @@ frappe.ui.form.on("Request for Quotation", {
 
 				return frappe.call({
 					type: "GET",
-					method: "erpnext.buying.doctype.request_for_quotation.request_for_quotation.make_supplier_quotation_from_rfq",
+					method: "erpnext.buying.doctype.request_for_quotation.mapper.make_supplier_quotation_from_rfq",
 					args: {
 						source_name: doc.name,
 						for_supplier: args.supplier,
@@ -250,10 +247,17 @@ frappe.ui.form.on("Request for Quotation", {
 					"subject",
 				])
 				.then((r) => {
-					frm.set_value(
-						"message_for_supplier",
-						r.message.use_html ? r.message.response_html : r.message.response
-					);
+					if (r.message.use_html) {
+						frm.set_value({
+							mfs_html: r.message.response_html,
+							use_html: 1,
+						});
+					} else {
+						frm.set_value({
+							message_for_supplier: r.message.response,
+							use_html: 0,
+						});
+					}
 					frm.set_value("subject", r.message.subject);
 				});
 		}
@@ -357,7 +361,7 @@ erpnext.buying.RequestforQuotationController = class RequestforQuotationControll
 				__("Material Request"),
 				function () {
 					erpnext.utils.map_current_doc({
-						method: "erpnext.stock.doctype.material_request.material_request.make_request_for_quotation",
+						method: "erpnext.stock.doctype.material_request.mapper.make_request_for_quotation",
 						source_doctype: "Material Request",
 						target: me.frm,
 						setters: {
@@ -381,7 +385,7 @@ erpnext.buying.RequestforQuotationController = class RequestforQuotationControll
 				__("Opportunity"),
 				function () {
 					erpnext.utils.map_current_doc({
-						method: "erpnext.crm.doctype.opportunity.opportunity.make_request_for_quotation",
+						method: "erpnext.crm.doctype.opportunity.mapper.make_request_for_quotation",
 						source_doctype: "Opportunity",
 						target: me.frm,
 						setters: {
@@ -421,7 +425,7 @@ erpnext.buying.RequestforQuotationController = class RequestforQuotationControll
 							dialog.hide();
 
 							erpnext.utils.map_current_doc({
-								method: "erpnext.buying.doctype.request_for_quotation.request_for_quotation.get_item_from_material_requests_based_on_supplier",
+								method: "erpnext.buying.doctype.request_for_quotation.mapper.get_item_from_material_requests_based_on_supplier",
 								source_name: args.supplier,
 								target: me.frm,
 								setters: {

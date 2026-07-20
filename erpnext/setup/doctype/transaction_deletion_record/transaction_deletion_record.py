@@ -75,7 +75,7 @@ def get_protected_doctypes():
 
 
 @frappe.whitelist()
-def get_company_link_fields(doctype_name):
+def get_company_link_fields(doctype_name: str):
 	"""Get all Company Link field names for a DocType (whitelisted for frontend autocomplete)
 
 	Args:
@@ -165,6 +165,8 @@ class TransactionDeletionRecord(Document):
 
 	def validate(self):
 		frappe.only_for("System Manager")
+		if not self.doctypes_to_be_ignored:
+			self.populate_doctypes_to_be_ignored_table()
 		self.validate_to_delete_list()
 
 	def validate_to_delete_list(self):
@@ -316,9 +318,22 @@ class TransactionDeletionRecord(Document):
 		Returns:
 		        list: List of child table DocType names (Table field options)
 		"""
-		return frappe.get_all(
-			"DocField", filters={"parent": doctype_name, "fieldtype": "Table"}, pluck="options"
+		child_tables = frappe.get_all(
+			"DocField",
+			filters={"parent": doctype_name, "fieldtype": ["in", ["Table", "Table MultiSelect"]]},
+			pluck="options",
 		)
+
+		if not child_tables:
+			return []
+
+		child_tables = frappe.get_all(
+			"DocType",
+			filters={"name": ["in", child_tables], "is_virtual": 0},
+			pluck="name",
+		)
+
+		return child_tables
 
 	def _get_to_delete_row_infos(self, doctype_name, company_field=None, company=None):
 		"""Get child tables and document count for a To Delete list row
@@ -424,7 +439,9 @@ class TransactionDeletionRecord(Document):
 		return {"count": len(self.doctypes_to_delete)}
 
 	@frappe.whitelist()
-	def populate_doctype_details(self, doctype_name, company=None, company_field=None):
+	def populate_doctype_details(
+		self, doctype_name: str, company: str | None = None, company_field: str | None = None
+	):
 		"""Get child DocTypes and document count for specified DocType
 
 		Args:
@@ -629,13 +646,15 @@ class TransactionDeletionRecord(Document):
 	def validate_doc_status(self):
 		if self.status != "Running":
 			frappe.throw(
-				_("{0} is not running. Cannot trigger events for this Document").format(
+				_("{0} is not running. Cannot trigger events for this document").format(
 					get_link_to_form("Transaction Deletion Record", self.name)
 				)
 			)
 
 	@frappe.whitelist()
 	def start_deletion_tasks(self):
+		self.check_permission("write")
+
 		# This method is the entry point for the chain of events that follow
 		self.db_set("status", "Running")
 		self._set_deletion_cache()
@@ -661,11 +680,9 @@ class TransactionDeletionRecord(Document):
 				self.enqueue_task(task="Delete Leads and Addresses")
 				return
 
-			frappe.db.sql(
-				"""delete from `tabBin` where warehouse in
-					(select name from tabWarehouse where company=%s)""",
-				self.company,
-			)
+			warehouses = frappe.get_all("Warehouse", filters={"company": self.company}, pluck="name")
+			if warehouses:
+				frappe.db.delete("Bin", {"warehouse": ["in", warehouses]})
 			self.db_set("delete_bin_data_status", "Completed")
 		self.enqueue_task(task="Delete Leads and Addresses")
 
@@ -685,8 +702,6 @@ class TransactionDeletionRecord(Document):
 					"Dynamic Link", filters={"link_name": ("in", leads)}, pluck="parent"
 				)
 				if addresses:
-					addresses = ["%s" % frappe.db.escape(addr) for addr in addresses]
-
 					address = qb.DocType("Address")
 					dl1 = qb.DocType("Dynamic Link")
 					dl2 = qb.DocType("Dynamic Link")
@@ -732,10 +747,11 @@ class TransactionDeletionRecord(Document):
 				self.enqueue_task(task="Clear Notifications")
 				return
 
-			company_obj = frappe.get_doc("Company", self.company)
-			company_obj.total_monthly_sales = 0
-			company_obj.sales_monthly_history = None
-			company_obj.save()
+			frappe.db.set_value(
+				"Company",
+				self.company,
+				{"total_monthly_sales": 0, "sales_monthly_history": None},
+			)
 			self.db_set("reset_company_default_values_status", "Completed")
 		self.enqueue_task(task="Clear Notifications")
 
@@ -1031,7 +1047,7 @@ def get_doctypes_to_be_ignored():
 
 
 @frappe.whitelist()
-def export_to_delete_template(name):
+def export_to_delete_template(name: str):
 	"""Export To Delete list as CSV via URL access"""
 	frappe.only_for("System Manager")
 	doc = frappe.get_doc("Transaction Deletion Record", name)
@@ -1040,7 +1056,7 @@ def export_to_delete_template(name):
 
 
 @frappe.whitelist()
-def process_import_template(transaction_deletion_record_name, file_url):
+def process_import_template(transaction_deletion_record_name: str, file_url: str):
 	"""Import CSV template and populate To Delete list"""
 	import os
 

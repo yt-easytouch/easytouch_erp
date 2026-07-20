@@ -2,7 +2,6 @@
 # See license.txt
 
 import frappe
-from frappe.tests import IntegrationTestCase
 from frappe.utils import nowdate
 
 from erpnext.controllers.stock_controller import (
@@ -14,9 +13,10 @@ from erpnext.controllers.stock_controller import (
 from erpnext.stock.doctype.delivery_note.test_delivery_note import create_delivery_note
 from erpnext.stock.doctype.item.test_item import create_item
 from erpnext.stock.doctype.stock_entry.stock_entry_utils import make_stock_entry
+from erpnext.tests.utils import ERPNextTestSuite
 
 
-class TestQualityInspection(IntegrationTestCase):
+class TestQualityInspection(ERPNextTestSuite):
 	def setUp(self):
 		super().setUp()
 		create_item("_Test Item with QA")
@@ -142,7 +142,9 @@ class TestQualityInspection(IntegrationTestCase):
 			inspection_type = "Outgoing"
 		for item in dn.items:
 			item.sample_size = item.qty
-		quality_inspections = make_quality_inspections(dn.doctype, dn.name, dn.items, inspection_type)
+		quality_inspections = make_quality_inspections(
+			dn.company, dn.doctype, dn.name, dn.items, inspection_type
+		)
 		self.assertEqual(len(dn.items), len(quality_inspections))
 
 		# cleanup
@@ -216,7 +218,7 @@ class TestQualityInspection(IntegrationTestCase):
 		qa.save()
 		self.assertEqual(qa.status, "Accepted")
 
-	@IntegrationTestCase.change_settings("System Settings", {"number_format": "#.###,##"})
+	@ERPNextTestSuite.change_settings("System Settings", {"number_format": "#.###,##"})
 	def test_diff_number_format(self):
 		self.assertEqual(frappe.db.get_default("number_format"), "#.###,##")  # sanity check
 
@@ -276,6 +278,65 @@ class TestQualityInspection(IntegrationTestCase):
 		self.assertFalse(qc)
 
 		se.delete()
+
+	def test_qi_updates_job_card_reference(self):
+		"""Submitting a QI with reference_type 'Job Card' writes its name onto the
+		Job Card's quality_inspection field (the Job Card branch of
+		QualityInspection.update_qc_reference)."""
+		create_item("_Test Item")
+
+		# Job Card whose production_item matches the QI item_code -> must be updated.
+		matching_jc = make_minimal_job_card(production_item="_Test Item")
+		# Job Card with a different production_item -> the production_item filter must
+		# keep it untouched.
+		other_item = create_item("_Test Item for QC " + frappe.utils.random_string(6)).name
+		non_matching_jc = make_minimal_job_card(production_item=other_item)
+
+		qa = create_quality_inspection(
+			item_code="_Test Item",
+			reference_type="Job Card",
+			reference_name=matching_jc,
+		)
+
+		# The converted UPDATE wrote the QI name onto the matching Job Card.
+		self.assertEqual(
+			frappe.db.get_value("Job Card", matching_jc, "quality_inspection"),
+			qa.name,
+		)
+		# The production_item filter excluded the Job Card with a different item.
+		self.assertFalse(frappe.db.get_value("Job Card", non_matching_jc, "quality_inspection"))
+
+	def test_qi_job_card_reference_respects_production_item(self):
+		"""A QI referencing a Job Card by name but whose item_code does not match the
+		Job Card's production_item must NOT update that Job Card."""
+		create_item("_Test Item")
+		mismatch_item = create_item("_Test Item Mismatch QC " + frappe.utils.random_string(6)).name
+
+		# Job Card produces a different item than the QI's item_code.
+		jc = make_minimal_job_card(production_item=mismatch_item)
+
+		create_quality_inspection(
+			item_code="_Test Item",
+			reference_type="Job Card",
+			reference_name=jc,
+		)
+
+		# name matches but production_item != item_code, so the row is left untouched.
+		self.assertFalse(frappe.db.get_value("Job Card", jc, "quality_inspection"))
+
+
+def make_minimal_job_card(production_item):
+	"""db_insert a minimal submitted Job Card row carrying only the columns the
+	converted UPDATE reads (name, production_item, quality_inspection, modified)."""
+	jc = frappe.new_doc("Job Card")
+	jc.name = "_T-Job Card-" + frappe.utils.random_string(10)
+	jc.flags.name_set = True
+	jc.production_item = production_item
+	jc.company = "_Test Company"
+	jc.for_quantity = 1
+	jc.docstatus = 1
+	jc.db_insert()
+	return jc.name
 
 
 def create_quality_inspection(**args):

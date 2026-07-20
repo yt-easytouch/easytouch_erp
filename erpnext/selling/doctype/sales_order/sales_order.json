@@ -18,6 +18,7 @@
   "column_break_7",
   "order_type",
   "transaction_date",
+  "transaction_time",
   "delivery_date",
   "column_break1",
   "tax_id",
@@ -73,14 +74,14 @@
   "in_words",
   "disable_rounded_total",
   "column_break_nuxg",
-  "rounded_total",
   "rounding_adjustment",
+  "rounded_total",
   "base_totals_section",
   "base_grand_total",
   "base_in_words",
   "column_break_bgfw",
-  "base_rounded_total",
   "base_rounding_adjustment",
+  "base_rounded_total",
   "section_break_efew",
   "advance_paid",
   "additional_discount_section",
@@ -122,6 +123,7 @@
   "company_contact_person",
   "payment_schedule_section",
   "payment_terms_section",
+  "ignore_default_payment_terms_template",
   "payment_terms_template",
   "payment_schedule",
   "terms_section_break",
@@ -149,7 +151,7 @@
   "loyalty_points",
   "column_break_116",
   "loyalty_amount",
-  "subscription_section",
+  "auto_repeat_section",
   "from_date",
   "to_date",
   "column_break_108",
@@ -161,17 +163,19 @@
   "column_break4",
   "select_print_heading",
   "language",
+  "utm_analytics_section",
+  "utm_source",
+  "utm_medium",
+  "column_break_ijxt",
+  "utm_campaign",
+  "utm_content",
   "additional_info_section",
   "is_internal_customer",
   "po_no",
   "po_date",
   "represents_company",
+  "title",
   "column_break_yvzv",
-  "utm_source",
-  "utm_campaign",
-  "utm_medium",
-  "utm_content",
-  "column_break_152",
   "inter_company_order_reference",
   "party_account_currency",
   "connections_tab"
@@ -842,6 +846,7 @@
    "hide_days": 1,
    "hide_seconds": 1,
    "label": "Loyalty Amount",
+   "options": "Company:company:default_currency",
    "print_hide": 1,
    "read_only": 1
   },
@@ -888,13 +893,15 @@
    "print_hide": 1
   },
   {
+   "description": "Applying a Discount Amount? When this Sales Order is partially fulfilled through multiple Delivery Notes and Sales Invoices, the Discount Amount is allocated on a FIFO basis. The earlier transactions receive a larger share of the discount. To spread the discount proportionally across item prices, use Additional Discount Percentage instead.",
    "fieldname": "discount_amount",
    "fieldtype": "Currency",
    "hide_days": 1,
    "hide_seconds": 1,
    "label": "Additional Discount Amount",
    "options": "currency",
-   "print_hide": 1
+   "print_hide": 1,
+   "show_description_on_click": 1
   },
   {
    "fieldname": "base_grand_total",
@@ -1324,6 +1331,7 @@
    "width": "50%"
   },
   {
+   "depends_on": "eval:doc.sales_partner",
    "fetch_from": "sales_partner.commission_rate",
    "fetch_if_empty": 1,
    "fieldname": "commission_rate",
@@ -1331,17 +1339,20 @@
    "hide_days": 1,
    "hide_seconds": 1,
    "label": "Commission Rate",
+   "no_copy": 1,
    "oldfieldname": "commission_rate",
    "oldfieldtype": "Currency",
    "print_hide": 1,
    "width": "100px"
   },
   {
+   "depends_on": "eval:doc.sales_partner",
    "fieldname": "total_commission",
    "fieldtype": "Currency",
    "hide_days": 1,
    "hide_seconds": 1,
    "label": "Total Commission",
+   "no_copy": 1,
    "oldfieldname": "total_commission",
    "oldfieldtype": "Currency",
    "options": "Company:company:default_currency",
@@ -1368,18 +1379,6 @@
    "oldfieldtype": "Table",
    "options": "Sales Team",
    "print_hide": 1
-  },
-  {
-   "allow_on_submit": 1,
-   "collapsible": 1,
-   "fieldname": "subscription_section",
-   "fieldtype": "Section Break",
-   "hide_days": 1,
-   "hide_seconds": 1,
-   "label": "Auto Repeat",
-   "no_copy": 1,
-   "print_hide": 1,
-   "read_only": 1
   },
   {
    "allow_on_submit": 1,
@@ -1484,9 +1483,12 @@
   },
   {
    "allow_on_submit": 1,
+   "depends_on": "eval:doc.sales_partner",
    "fieldname": "amount_eligible_for_commission",
    "fieldtype": "Currency",
    "label": "Amount Eligible for Commission",
+   "no_copy": 1,
+   "options": "Company:company:default_currency",
    "read_only": 1
   },
   {
@@ -1566,10 +1568,6 @@
    "fieldname": "additional_info_section",
    "fieldtype": "Section Break",
    "label": "Additional Info"
-  },
-  {
-   "fieldname": "column_break_152",
-   "fieldtype": "Column Break"
   },
   {
    "fieldname": "incoterm",
@@ -1717,6 +1715,52 @@
    "hide_days": 1,
    "hide_seconds": 1,
    "label": "Additional Discount"
+  },
+  {
+   "fieldname": "column_break_ijxt",
+   "fieldtype": "Column Break"
+  },
+  {
+   "collapsible": 1,
+   "fieldname": "utm_analytics_section",
+   "fieldtype": "Section Break",
+   "label": "UTM Analytics"
+  },
+  {
+   "default": "Now",
+   "depends_on": "is_internal_customer",
+   "fieldname": "transaction_time",
+   "fieldtype": "Time",
+   "label": "Time",
+   "mandatory_depends_on": "is_internal_customer"
+  },
+  {
+   "default": "0",
+   "fieldname": "ignore_default_payment_terms_template",
+   "fieldtype": "Check",
+   "hidden": 1,
+   "label": "Ignore Default Payment Terms Template",
+   "read_only": 1
+  },
+  {
+   "allow_on_submit": 1,
+   "collapsible": 1,
+   "fieldname": "auto_repeat_section",
+   "fieldtype": "Section Break",
+   "hide_days": 1,
+   "hide_seconds": 1,
+   "label": "Auto Repeat",
+   "no_copy": 1,
+   "print_hide": 1,
+   "read_only": 1
+  },
+  {
+   "allow_on_submit": 1,
+   "fieldname": "title",
+   "fieldtype": "Data",
+   "label": "Title",
+   "no_copy": 1,
+   "print_hide": 1
   }
  ],
  "grid_page_length": 50,
@@ -1724,7 +1768,7 @@
  "idx": 105,
  "is_submittable": 1,
  "links": [],
- "modified": "2026-02-06 15:35:47.502692",
+ "modified": "2026-06-24 12:00:00.000000",
  "modified_by": "Administrator",
  "module": "Selling",
  "name": "Sales Order",

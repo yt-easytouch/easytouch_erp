@@ -5,30 +5,32 @@
 import json
 
 import frappe
-from frappe.tests import IntegrationTestCase, change_settings
+from frappe.tests import change_settings
 from frappe.utils import add_days, flt, getdate, nowdate
 from frappe.utils.data import today
 
 from erpnext.accounts.doctype.payment_entry.payment_entry import get_payment_entry
 from erpnext.accounts.party import get_due_date_from_template
-from erpnext.buying.doctype.purchase_order.purchase_order import (
+from erpnext.buying.doctype.purchase_order.mapper import (
 	make_inter_company_sales_order,
 	make_purchase_receipt,
 )
-from erpnext.buying.doctype.purchase_order.purchase_order import (
+from erpnext.buying.doctype.purchase_order.mapper import (
 	make_purchase_invoice as make_pi_from_po,
 )
 from erpnext.controllers.accounts_controller import InvalidQtyError, update_child_qty_rate
 from erpnext.manufacturing.doctype.blanket_order.test_blanket_order import make_blanket_order
 from erpnext.stock.doctype.item.test_item import make_item
-from erpnext.stock.doctype.material_request.material_request import make_purchase_order
+from erpnext.stock.doctype.material_request.mapper import make_purchase_order
 from erpnext.stock.doctype.material_request.test_material_request import make_material_request
-from erpnext.stock.doctype.purchase_receipt.purchase_receipt import (
+from erpnext.stock.doctype.purchase_receipt.mapper import (
 	make_purchase_invoice as make_pi_from_pr,
 )
+from erpnext.tests.utils import ERPNextTestSuite
 
 
-class TestPurchaseOrder(IntegrationTestCase):
+class TestPurchaseOrder(ERPNextTestSuite):
+	@ERPNextTestSuite.change_settings("Buying Settings", {"allow_multiple_items": 1})
 	def test_purchase_order_qty(self):
 		po = create_purchase_order(qty=1, do_not_save=True)
 
@@ -96,6 +98,60 @@ class TestPurchaseOrder(IntegrationTestCase):
 		po.load_from_db()
 		self.assertEqual(po.get("items")[0].received_qty, 4)
 
+	def test_make_purchase_receipt_respects_over_receipt_allowance(self):
+		"""make_purchase_receipt must include fully-received PO lines when
+		over_delivery_receipt_allowance permits further receipt.
+
+		Regression test for #55246: the mapper dropped rows once
+		received_qty >= qty, ignoring the configured tolerance.
+		"""
+		from erpnext.buying.doctype.purchase_order.mapper import make_purchase_receipt
+
+		# 50% tolerance — 10 ordered allows up to 15 received
+		frappe.db.set_value("Item", "_Test Item", "over_delivery_receipt_allowance", 50)
+		try:
+			po = create_purchase_order()
+			create_pr_against_po(po.name, received_qty=10)
+
+			po.load_from_db()
+			self.assertEqual(po.get("items")[0].received_qty, 10)
+
+			# onload must flag pending receivable qty so the UI keeps the
+			# "Create > Purchase Receipt" button visible even at per_received = 100
+			po.run_method("onload")
+			self.assertTrue(
+				po.get_onload("has_pending_receivable_qty"),
+				"onload should flag pending receivable qty while tolerance is available",
+			)
+
+			# Re-mapping the same PO must yield a PR with the row present
+			# and qty pre-filled to the remaining tolerance (15 - 10 = 5)
+			pr = make_purchase_receipt(po.name)
+			self.assertEqual(
+				len(pr.get("items")), 1, "Fully-received row dropped despite available tolerance"
+			)
+			self.assertEqual(pr.get("items")[0].item_code, "_Test Item")
+			self.assertEqual(pr.get("items")[0].qty, 5)
+			self.assertEqual(pr.get("items")[0].purchase_order_item, po.get("items")[0].name)
+
+			# Tolerance exhausted → row must be filtered out as before
+			create_pr_against_po(po.name, received_qty=5)
+			po.load_from_db()
+			self.assertEqual(po.get("items")[0].received_qty, 15)
+
+			po.run_method("onload")
+			self.assertFalse(
+				po.get_onload("has_pending_receivable_qty"),
+				"onload should clear pending receivable flag once tolerance is exhausted",
+			)
+
+			pr_empty = make_purchase_receipt(po.name)
+			self.assertEqual(
+				len(pr_empty.get("items")), 0, "Row should be dropped once tolerance is exhausted"
+			)
+		finally:
+			frappe.db.set_value("Item", "_Test Item", "over_delivery_receipt_allowance", 0)
+
 	def test_ordered_qty_against_pi_with_update_stock(self):
 		existing_ordered_qty = get_ordered_qty()
 		po = create_purchase_order()
@@ -125,6 +181,44 @@ class TestPurchaseOrder(IntegrationTestCase):
 		frappe.db.set_value("Item", "_Test Item", "over_delivery_receipt_allowance", 0)
 		frappe.db.set_value("Item", "_Test Item", "over_billing_allowance", 0)
 		frappe.db.set_single_value("Accounts Settings", "over_billing_allowance", 0)
+
+	def test_over_order_allowance_against_material_request(self) -> None:
+		"""Over Order Allowance in Buying Settings must govern PO qty vs MR qty independently
+		from Over Delivery/Receipt Allowance which governs receipt/delivery against a PO."""
+		mr = make_material_request(qty=100)
+		po = make_purchase_order(mr.name)
+		po.supplier = "_Test Supplier"
+		po.items[0].qty = 110  # 10% over the MR qty
+
+		# Without any allowance, submitting should raise an OverAllowanceError
+		from erpnext.controllers.status_updater import OverAllowanceError
+
+		frappe.db.set_single_value("Buying Settings", "over_order_allowance", 0)
+		frappe.db.set_single_value("Stock Settings", "over_delivery_receipt_allowance", 0)
+		self.assertRaises(OverAllowanceError, po.submit)
+
+		# Granting 10% in Over Order Allowance (Buying Settings) must allow the submit
+		frappe.db.set_single_value("Buying Settings", "over_order_allowance", 10)
+		po.reload()
+		po.items[0].qty = 110
+		po.submit()
+		self.assertEqual(po.docstatus, 1)
+		po.cancel()
+
+		# Over Delivery/Receipt Allowance must remain independent — changing it must not
+		# affect the MR → PO validation when Over Order Allowance is 0.
+		frappe.db.set_single_value("Buying Settings", "over_order_allowance", 0)
+		frappe.db.set_single_value("Stock Settings", "over_delivery_receipt_allowance", 50)
+
+		mr2 = make_material_request(qty=100)
+		po2 = make_purchase_order(mr2.name)
+		po2.supplier = "_Test Supplier"
+		po2.items[0].qty = 110
+		self.assertRaises(OverAllowanceError, po2.submit)
+
+		# cleanup
+		frappe.db.set_single_value("Buying Settings", "over_order_allowance", 0)
+		frappe.db.set_single_value("Stock Settings", "over_delivery_receipt_allowance", 0)
 
 	def test_update_remove_child_linked_to_mr(self):
 		"""Test impact on linked PO and MR on deleting/updating row."""
@@ -289,6 +383,30 @@ class TestPurchaseOrder(IntegrationTestCase):
 		# ordered qty should decrease (back to initial) on row deletion
 		self.assertEqual(get_ordered_qty(), existing_ordered_qty)
 
+	def test_discount_amount_partial_purchase_receipt(self):
+		po = create_purchase_order(qty=4, rate=100, do_not_save=1)
+		po.apply_discount_on = "Grand Total"
+		po.discount_amount = 120
+		po.save()
+		po.submit()
+
+		self.assertEqual(po.grand_total, 280)
+
+		pr1 = make_purchase_receipt(po.name)
+		pr1.items[0].qty = 3
+		pr1.save()
+		pr1.submit()
+
+		self.assertEqual(pr1.discount_amount, 120)
+		self.assertEqual(pr1.grand_total, 180)
+
+		pr2 = make_purchase_receipt(po.name)
+		pr2.save()
+		pr2.submit()
+
+		self.assertEqual(pr2.discount_amount, 0)
+		self.assertEqual(pr2.grand_total, 100)
+
 	def test_update_child_perm(self):
 		po = create_purchase_order(item_code="_Test Item", qty=4)
 
@@ -359,10 +477,8 @@ class TestPurchaseOrder(IntegrationTestCase):
 			item_doc.save()
 		else:
 			# update valid from
-			frappe.db.sql(
-				"""UPDATE `tabItem Tax` set valid_from = CURRENT_DATE
-				where parent = %(item)s and item_tax_template = %(tax)s""",
-				{"item": item, "tax": tax_template},
+			frappe.db.set_value(
+				"Item Tax", {"parent": item, "item_tax_template": tax_template}, "valid_from", nowdate()
 			)
 
 		po = create_purchase_order(item_code=item, qty=1, do_not_save=1)
@@ -409,10 +525,8 @@ class TestPurchaseOrder(IntegrationTestCase):
 		self.assertEqual(po.taxes[1].total, 840)
 
 		# teardown
-		frappe.db.sql(
-			"""UPDATE `tabItem Tax` set valid_from = NULL
-			where parent = %(item)s and item_tax_template = %(tax)s""",
-			{"item": item, "tax": tax_template},
+		frappe.db.set_value(
+			"Item Tax", {"parent": item, "item_tax_template": tax_template}, "valid_from", None
 		)
 		po.cancel()
 		po.delete()
@@ -493,7 +607,7 @@ class TestPurchaseOrder(IntegrationTestCase):
 		self.assertEqual(po.get("items")[0].received_qty, 5)
 
 	def test_purchase_order_invoice_receipt_workflow(self):
-		from erpnext.accounts.doctype.purchase_invoice.purchase_invoice import make_purchase_receipt
+		from erpnext.accounts.doctype.purchase_invoice.mapper import make_purchase_receipt
 
 		po = create_purchase_order()
 		pi = make_pi_from_po(po.name)
@@ -534,21 +648,21 @@ class TestPurchaseOrder(IntegrationTestCase):
 
 	def test_purchase_order_on_hold(self):
 		po = create_purchase_order(item_code="_Test Product Bundle Item")
-		po.db_set("Status", "On Hold")
+		po.db_set("status", "On Hold")
 		pi = make_pi_from_po(po.name)
 		pr = make_purchase_receipt(po.name)
 		self.assertRaises(frappe.ValidationError, pr.submit)
 		self.assertRaises(frappe.ValidationError, pi.submit)
 
-	@IntegrationTestCase.change_settings("Accounts Settings", {"automatically_fetch_payment_terms": 1})
+	@ERPNextTestSuite.change_settings("Accounts Settings", {"automatically_fetch_payment_terms": 1})
 	def test_make_purchase_invoice_with_terms(self):
 		po = create_purchase_order(do_not_save=True)
-
-		self.assertRaises(frappe.ValidationError, make_pi_from_po, po.name)
-
 		po.update({"payment_terms_template": "_Test Payment Term Template"})
 
 		po.save()
+
+		self.assertRaises(frappe.ValidationError, make_pi_from_po, po.name)
+
 		po.submit()
 
 		self.assertEqual(po.payment_schedule[0].payment_amount, 2500.0)
@@ -712,7 +826,7 @@ class TestPurchaseOrder(IntegrationTestCase):
 		)
 		self.assertEqual(due_date, "2023-03-31")
 
-	@IntegrationTestCase.change_settings("Accounts Settings", {"automatically_fetch_payment_terms": 0})
+	@ERPNextTestSuite.change_settings("Accounts Settings", {"automatically_fetch_payment_terms": 0})
 	def test_terms_are_not_copied_if_automatically_fetch_payment_terms_is_unchecked(self):
 		po = create_purchase_order(do_not_save=1)
 		po.payment_terms_template = "_Test Payment Term Template"
@@ -737,7 +851,7 @@ class TestPurchaseOrder(IntegrationTestCase):
 		pi.insert()
 		self.assertTrue(pi.get("payment_schedule"))
 
-	@IntegrationTestCase.change_settings(
+	@ERPNextTestSuite.change_settings(
 		"Accounts Settings", {"unlink_advance_payment_on_cancelation_of_order": 1}
 	)
 	def test_advance_payment_entry_unlink_against_purchase_order(self):
@@ -785,6 +899,7 @@ class TestPurchaseOrder(IntegrationTestCase):
 		Test "Advance Paid" on Purchase Order, when "Book Advance Payments in Separate Party Account" is enabled and
 		the payment entry linked to the Order is allocated to Purchase Invoice.
 		"""
+		frappe.flags.is_reverse_depr_entry = False
 		supplier = "_Test Supplier"
 		company = "_Test Company"
 
@@ -808,12 +923,13 @@ class TestPurchaseOrder(IntegrationTestCase):
 		company_doc.book_advance_payments_in_separate_party_account = False
 		company_doc.save()
 
-	@IntegrationTestCase.change_settings(
+	@ERPNextTestSuite.change_settings(
 		"Accounts Settings", {"unlink_advance_payment_on_cancelation_of_order": 1}
 	)
 	def test_advance_paid_upon_payment_entry_cancellation(self):
 		from erpnext.accounts.doctype.payment_entry.test_payment_entry import get_payment_entry
 
+		frappe.flags.is_reverse_depr_entry = False
 		supplier = "_Test Supplier USD"
 		company = "_Test Company"
 
@@ -848,6 +964,7 @@ class TestPurchaseOrder(IntegrationTestCase):
 		self.assertEqual(po_doc.advance_paid, 0)
 		self.assertEqual(po_doc.party_account_currency, "USD")
 
+	@ERPNextTestSuite.change_settings("Buying Settings", {"allow_multiple_items": 1})
 	def test_schedule_date(self):
 		po = create_purchase_order(do_not_submit=True)
 		po.schedule_date = None
@@ -904,7 +1021,7 @@ class TestPurchaseOrder(IntegrationTestCase):
 		bo.load_from_db()
 		self.assertEqual(bo.items[0].ordered_qty, 5)
 
-	@IntegrationTestCase.change_settings("Accounts Settings", {"automatically_fetch_payment_terms": 1})
+	@ERPNextTestSuite.change_settings("Accounts Settings", {"automatically_fetch_payment_terms": 1})
 	def test_payment_terms_are_fetched_when_creating_purchase_invoice(self):
 		from erpnext.accounts.doctype.payment_entry.test_payment_entry import (
 			create_payment_terms_template,
@@ -929,14 +1046,14 @@ class TestPurchaseOrder(IntegrationTestCase):
 
 	def test_internal_transfer_flow(self):
 		from erpnext.accounts.doctype.cost_center.test_cost_center import create_cost_center
-		from erpnext.accounts.doctype.sales_invoice.sales_invoice import (
+		from erpnext.accounts.doctype.sales_invoice.mapper import (
 			make_inter_company_purchase_invoice,
 		)
-		from erpnext.selling.doctype.sales_order.sales_order import (
+		from erpnext.selling.doctype.sales_order.mapper import (
 			make_delivery_note,
 			make_sales_invoice,
 		)
-		from erpnext.stock.doctype.delivery_note.delivery_note import make_inter_company_purchase_receipt
+		from erpnext.stock.doctype.delivery_note.mapper import make_inter_company_purchase_receipt
 
 		frappe.db.set_single_value("Selling Settings", "maintain_same_sales_rate", 1)
 		frappe.db.set_single_value("Buying Settings", "maintain_same_rate", 1)
@@ -1077,7 +1194,7 @@ class TestPurchaseOrder(IntegrationTestCase):
 		self.assertEqual(po.items[0].fg_item_qty, 30)
 
 	def test_new_sc_flow(self):
-		from erpnext.buying.doctype.purchase_order.purchase_order import make_subcontracting_order
+		from erpnext.buying.doctype.purchase_order.mapper import make_subcontracting_order
 
 		po = create_po_for_sc_testing()
 		sco = make_subcontracting_order(po.name)
@@ -1143,7 +1260,7 @@ class TestPurchaseOrder(IntegrationTestCase):
 		# Test - 8: Since this PO is now fully subcontracted, creating a new SCO from it should throw error
 		self.assertRaises(frappe.ValidationError, make_subcontracting_order, po.name)
 
-	@IntegrationTestCase.change_settings("Buying Settings", {"auto_create_subcontracting_order": 1})
+	@ERPNextTestSuite.change_settings("Buying Settings", {"auto_create_subcontracting_order": 1})
 	def test_auto_create_subcontracting_order(self):
 		from erpnext.controllers.tests.test_subcontracting_controller import (
 			make_bom_for_subcontracted_items,
@@ -1176,6 +1293,7 @@ class TestPurchaseOrder(IntegrationTestCase):
 		self.assertTrue(frappe.db.get_value("Subcontracting Order", {"purchase_order": po.name}))
 
 	def test_purchase_order_advance_payment_status(self):
+		frappe.flags.is_reverse_depr_entry = False
 		from erpnext.accounts.doctype.payment_entry.test_payment_entry import get_payment_entry
 		from erpnext.accounts.doctype.payment_request.payment_request import make_payment_request
 
@@ -1204,7 +1322,7 @@ class TestPurchaseOrder(IntegrationTestCase):
 		self.assertEqual(frappe.db.get_value(po.doctype, po.name, "advance_payment_status"), "Not Initiated")
 
 	def test_po_billed_amount_against_return_entry(self):
-		from erpnext.accounts.doctype.purchase_invoice.purchase_invoice import make_debit_note
+		from erpnext.accounts.doctype.purchase_invoice.mapper import make_debit_note
 
 		# Create a Purchase Order and Fully Bill it
 		po = create_purchase_order()
@@ -1235,7 +1353,7 @@ class TestPurchaseOrder(IntegrationTestCase):
 		po.reload()
 		self.assertEqual(po.per_billed, 100)
 
-	@IntegrationTestCase.change_settings("Buying Settings", {"allow_zero_qty_in_purchase_order": 1})
+	@ERPNextTestSuite.change_settings("Buying Settings", {"allow_zero_qty_in_purchase_order": 1})
 	def test_receive_zero_qty_purchase_order(self):
 		"""
 		Test the flow of a Unit Price PO and PR creation against it until completion.
@@ -1284,7 +1402,7 @@ class TestPurchaseOrder(IntegrationTestCase):
 		self.assertEqual(po.per_received, 100.0)
 		self.assertEqual(po.status, "To Bill")
 
-	@IntegrationTestCase.change_settings("Buying Settings", {"allow_zero_qty_in_purchase_order": 1})
+	@ERPNextTestSuite.change_settings("Buying Settings", {"allow_zero_qty_in_purchase_order": 1})
 	def test_bill_zero_qty_purchase_order(self):
 		po = create_purchase_order(qty=0)
 
@@ -1309,7 +1427,7 @@ class TestPurchaseOrder(IntegrationTestCase):
 		self.assertFalse(po.per_billed)
 		self.assertEqual(po.status, "To Receive and Bill")
 
-	@IntegrationTestCase.change_settings("Buying Settings", {"maintain_same_rate": 0})
+	@ERPNextTestSuite.change_settings("Buying Settings", {"maintain_same_rate": 0})
 	def test_purchase_invoice_creation_with_partial_qty(self):
 		po = create_purchase_order(qty=100, rate=10)
 
@@ -1329,6 +1447,7 @@ class TestPurchaseOrder(IntegrationTestCase):
 		self.assertEqual(pi.items[0].qty, 50)
 
 	def test_multiple_advances_against_purchase_order_are_allocated_across_partial_purchase_invoices(self):
+		frappe.flags.is_reverse_depr_entry = False
 		# step - 1: create PO
 		po = create_purchase_order(qty=10, rate=10)
 
@@ -1376,6 +1495,116 @@ class TestPurchaseOrder(IntegrationTestCase):
 		self.assertEqual(pi_1.status, "Paid")
 		self.assertEqual(pi_2.status, "Paid")
 		self.assertEqual(po.status, "Completed")
+
+	def test_purchase_order_over_billing_missing_item(self):
+		item1 = make_item(
+			"_Test Item for Overbilling",
+		).name
+
+		item2 = make_item(
+			"_Test Item for Overbilling 2",
+		).name
+
+		po = create_purchase_order(qty=10, rate=1000, item_code=item1, do_not_save=1)
+		po.append("items", {"item_code": item2, "qty": 5, "rate": 20, "warehouse": "_Test Warehouse - _TC"})
+		po.taxes = []
+		po.insert()
+		po.submit()
+
+		pi1 = make_pi_from_po(po.name)
+		pi1.items[0].qty = 8
+		pi1.items[0].rate = 1250
+		pi1.remove(pi1.items[1])
+		pi1.insert()
+		pi1.submit()
+
+		self.assertEqual(pi1.grand_total, 10000.0)
+		self.assertEqual(len(pi1.items), 1)
+
+		pi2 = make_pi_from_po(po.name)
+		self.assertEqual(len(pi2.items), 2)
+
+	def test_get_item_details_propagates_drop_ship_flag_to_po(self):
+		"""`get_item_details` should propagate the Item master's
+		`delivered_by_supplier` flag to Purchase Orders, not only to Sales
+		Orders/Invoices, so that POs can be created as drop-ship directly
+		(via the standard item lookup the form uses) without going through
+		the Sales Order → Purchase Order mapping pipeline.
+		"""
+		from erpnext.stock.get_item_details import get_item_details
+
+		item = make_item("_Test Drop Ship From Master", {"is_stock_item": 1, "delivered_by_supplier": 1})
+
+		ctx = frappe._dict(
+			{
+				"item_code": item.item_code,
+				"doctype": "Purchase Order",
+				"company": "_Test Company",
+				"supplier": "_Test Supplier",
+				"transaction_date": nowdate(),
+				"currency": "INR",
+				"conversion_rate": 1.0,
+				"buying_price_list": "Standard Buying",
+				"price_list_currency": "INR",
+				"plc_conversion_rate": 1.0,
+				"qty": 1,
+			}
+		)
+
+		details = get_item_details(ctx, frappe.new_doc("Purchase Order"))
+		self.assertEqual(details.get("delivered_by_supplier"), 1)
+
+	def test_drop_ship_po_allows_non_company_shipping_address_without_so(self):
+		"""A PO with a drop-ship item should save with a non-company shipping
+		address even when there is no linked Sales Order.
+		Regression test for https://github.com/frappe/erpnext/issues/51629.
+		"""
+		from erpnext.crm.doctype.prospect.test_prospect import make_address
+
+		item = make_item("_Test Drop Ship Direct PO", {"is_stock_item": 1, "delivered_by_supplier": 1})
+
+		customer_shipping = make_address(
+			address_title="Drop Ship Direct PO", address_type="Shipping", address_line1="1"
+		)
+		customer_shipping.append("links", {"link_doctype": "Customer", "link_name": "_Test Customer"})
+		customer_shipping.save()
+
+		po = create_purchase_order(item=item.item_code, qty=1, do_not_save=True)
+		# In the UI, `get_item_details` propagates the master flag to the row when
+		# the item is added; here we simulate that step explicitly.
+		po.items[0].delivered_by_supplier = 1
+		po.items[0].warehouse = ""
+		po.shipping_address = customer_shipping.name
+		po.save()
+
+		self.assertEqual(po.items[0].delivered_by_supplier, 1)
+		self.assertFalse(po.items[0].warehouse)
+		self.assertEqual(po.shipping_address, customer_shipping.name)
+
+	def test_drop_ship_flag_overridable_per_po_line(self):
+		"""The drop-ship default from the Item master should be overridable
+		on individual PO lines (e.g. ordering a normally drop-shipped item
+		into the own warehouse for samples or stock).
+		"""
+		item = make_item("_Test Drop Ship Override", {"is_stock_item": 1, "delivered_by_supplier": 1})
+
+		po = create_purchase_order(item=item.item_code, qty=1, do_not_save=True)
+		po.items[0].delivered_by_supplier = 0
+		po.save()
+
+		self.assertEqual(po.items[0].delivered_by_supplier, 0)
+		self.assertEqual(po.items[0].warehouse, "_Test Warehouse - _TC")
+
+	def test_remove_unlinked_item_from_mixed_po_does_not_crash(self):
+		"""In a PO that mixes SO-linked and freely-added items, removing an
+		item that has no `sales_order_item` via Update Items must not crash
+		on the missing reference.
+		"""
+		po = create_purchase_order(do_not_submit=True)
+		# Force the SO codepath without needing a real linked Sales Order:
+		po.items[0].sales_order = "DUMMY-SO"
+
+		po.update_ordered_qty_in_so_for_removed_items([frappe._dict({"sales_order_item": None, "qty": 1})])
 
 
 def create_po_for_sc_testing():
@@ -1534,11 +1763,6 @@ def create_purchase_order(**args):
 		po.set_missing_values()
 		po.insert()
 		if not args.do_not_submit:
-			if po.is_subcontracted:
-				supp_items = po.get("supplied_items")
-				for d in supp_items:
-					if not d.reserve_warehouse:
-						d.reserve_warehouse = args.warehouse or "_Test Warehouse - _TC"
 			po.submit()
 
 	return po
@@ -1558,6 +1782,3 @@ def get_ordered_qty(item_code="_Test Item", warehouse="_Test Warehouse - _TC"):
 
 def get_requested_qty(item_code="_Test Item", warehouse="_Test Warehouse - _TC"):
 	return flt(frappe.db.get_value("Bin", {"item_code": item_code, "warehouse": warehouse}, "indented_qty"))
-
-
-EXTRA_TEST_RECORD_DEPENDENCIES = ["BOM", "Item Price", "Warehouse"]

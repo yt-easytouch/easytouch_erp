@@ -77,9 +77,11 @@ class MaterialRequirementsPlanningReport:
 				(so.docstatus == 1)
 				& (so.status.notin(["Closed", "Completed", "Stopped"]))
 				& (so_item.docstatus == 1)
-				& (so_item.item_code.isin(items))
 			)
 		)
+
+		if items:
+			query = query.where(so_item.item_code.isin(items))
 
 		if self.filters.get("warehouse"):
 			warehouses = [self.filters.get("warehouse")]
@@ -1217,7 +1219,7 @@ def get_item_lead_time(item_code, type_of_material):
 			.when(
 				(doctype.manufacturing_time_in_mins.isnull() | (doctype.manufacturing_time_in_mins <= 0)), 0
 			)
-			.else_(1440 / doctype.manufacturing_time_in_mins + doctype.buffer_time)
+			.else_(1440.0 / doctype.manufacturing_time_in_mins + doctype.buffer_time)
 			.as_("lead_time")
 		)
 	else:
@@ -1295,7 +1297,7 @@ def get_item_capacity(item_code, bucket_size):
 
 
 @frappe.whitelist()
-def make_order(selected_rows, company, warehouse=None, mps=None):
+def make_order(selected_rows: str | list, company: str, warehouse: str | None = None, mps: str | None = None):
 	if not frappe.has_permission("Purchase Order", "create"):
 		frappe.throw(_("Not permitted to make Purchase Orders"), frappe.PermissionError)
 

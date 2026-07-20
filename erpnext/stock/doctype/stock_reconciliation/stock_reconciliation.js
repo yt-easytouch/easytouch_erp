@@ -6,7 +6,7 @@ frappe.provide("erpnext.accounts.dimensions");
 
 frappe.ui.form.on("Stock Reconciliation", {
 	setup(frm) {
-		frm.ignore_doctypes_on_cancel_all = ["Serial and Batch Bundle"];
+		frm.ignore_doctypes_on_cancel_all = ["Serial and Batch Bundle", "Item Standard Cost"];
 		frm.barcode_scanner = new erpnext.utils.BarcodeScanner({
 			frm: frm,
 			uom_field: "stock_uom",
@@ -76,6 +76,8 @@ frappe.ui.form.on("Stock Reconciliation", {
 	},
 
 	refresh: function (frm) {
+		erpnext.toggle_serial_batch_fields(frm);
+
 		if (frm.doc.docstatus < 1) {
 			frm.add_custom_button(__("Fetch Items from Warehouse"), function () {
 				frm.events.get_items(frm);

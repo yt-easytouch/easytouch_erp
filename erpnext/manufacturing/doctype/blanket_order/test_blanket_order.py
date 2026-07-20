@@ -1,16 +1,16 @@
 # Copyright (c) 2018, Frappe Technologies Pvt. Ltd. and Contributors
 # See license.txt
 import frappe
-from frappe.tests import IntegrationTestCase
 from frappe.utils import add_months, today
 
 from erpnext import get_company_currency
 from erpnext.stock.doctype.item.test_item import make_item
+from erpnext.tests.utils import ERPNextTestSuite
 
 from .blanket_order import make_order
 
 
-class TestBlanketOrder(IntegrationTestCase):
+class TestBlanketOrder(ERPNextTestSuite):
 	def setUp(self):
 		frappe.flags.args = frappe._dict()
 
@@ -90,6 +90,29 @@ class TestBlanketOrder(IntegrationTestCase):
 
 		frappe.db.set_single_value("Buying Settings", "blanket_order_allowance", 10)
 		po.submit()
+
+	def test_blanket_order_over_order_aggregated_across_rows(self):
+		# the over-order check should sum the same item across multiple order rows
+		frappe.db.set_single_value("Selling Settings", "blanket_order_allowance", 0)
+		bo = make_blanket_order(blanket_order_type="Selling", quantity=100)
+
+		frappe.flags.args.doctype = "Sales Order"
+		so = make_order(bo.name)
+		so.currency = get_company_currency(so.company)
+		so.delivery_date = today()
+		so.items[0].qty = 60
+		so.append(
+			"items",
+			{
+				"item_code": so.items[0].item_code,
+				"qty": 50,  # 60 + 50 = 110 > 100 blanket qty
+				"rate": so.items[0].rate,
+				"delivery_date": today(),
+				"against_blanket_order": 1,
+				"blanket_order": bo.name,
+			},
+		)
+		self.assertRaises(frappe.ValidationError, so.submit)
 
 	def test_party_item_code(self):
 		item_doc = make_item("_Test Item 1 for Blanket Order")
