@@ -170,7 +170,15 @@ def _get_pricing_rules(apply_on, args, values):
 		or []
 	)
 
-	return pricing_rules
+	# deduplicate — a rule with multiple item_group rows returns once per row
+	seen = set()
+	deduped = []
+	for pr in pricing_rules:
+		if pr.name not in seen:
+			seen.add(pr.name)
+			deduped.append(pr)
+
+	return deduped
 
 
 def apply_multiple_pricing_rules(pricing_rules):
@@ -343,14 +351,15 @@ def filter_pricing_rules(args, pricing_rules, doc=None):
 				list(filter(lambda x: x.for_price_list == args.price_list, pricing_rules)) or pricing_rules
 			)
 
-	if len(pricing_rules) > 1 and not args.for_shopping_cart:
+	if len(pricing_rules) > 1 and not args.for_shopping_cart and max_priority:
 		frappe.throw(
 			_(
 				"Multiple Price Rules exists with same criteria, please resolve conflict by assigning priority. Price Rules: {0}"
 			).format("\n".join(d.name for d in pricing_rules)),
 			MultiplePricingRuleConflict,
 		)
-	elif pricing_rules:
+
+	if pricing_rules:
 		return pricing_rules[0]
 
 
