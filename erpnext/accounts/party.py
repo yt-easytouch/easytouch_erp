@@ -430,6 +430,8 @@ def get_party_account(party_type, party=None, company=None, include_advance=Fals
 	finally will return default."""
 
 	def account_perm_check(account):
+		if frappe.flags.ignore_permissions:
+			return
 		ptype = "select" if frappe.only_has_select_perm("Account") else "read"
 		if frappe.has_permission("Account", ptype, account):
 			return
