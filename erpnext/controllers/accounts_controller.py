@@ -39,6 +39,7 @@ from erpnext.accounts.utils import (
 	get_advance_payment_doctypes as _get_advance_payment_doctypes,
 )
 from erpnext.accounts.utils import get_fiscal_year, validate_fiscal_year
+from erpnext.controllers.item_close import clear_closed_rows_on_amend
 from erpnext.controllers.print_settings import (
 	set_print_templates_for_item_table,
 	set_print_templates_for_taxes,
@@ -210,7 +211,40 @@ class AccountsController(TransactionBase):
 				)
 				frappe.msgprint(msg)
 
+	def is_negative_grand_total_allowed(self) -> bool:
+		"""Return True if this document may save with a negative grand total.
+
+		Sales Order and Purchase Order never post to the GL, so a negative
+		total is safe there whenever the user has explicitly opted into
+		negative rates via Selling/Buying Settings. Every other
+		AccountsController doctype (invoices, delivery notes, receipts,
+		quotations, ...) keeps relying on the `is_return` escape hatch only.
+		"""
+		if self.doctype == "Sales Order":
+			return bool(frappe.get_single_value("Selling Settings", "allow_negative_rates_for_items"))
+
+		if self.doctype == "Purchase Order":
+			return bool(frappe.get_single_value("Buying Settings", "allow_negative_rates_for_items"))
+
+		return False
+
+	def is_item_closable(self, item):
+		"""A row can be closed while anything is still pending on it.
+
+		Billing is the axis every closable document shares; the order doctypes
+		extend this with their own fulfilment axis.
+
+		Amounts are compared as magnitudes so that return rows stay closable.
+		That is deliberate: writing off a credit note that will never be issued
+		is a real decision, and closing a whole return document is already
+		allowed. Leaving it to the sign of the amount would decide it by
+		accident.
+		"""
+		return abs(flt(item.billed_amt)) < abs(flt(item.amount))
+
 	def validate(self):
+		clear_closed_rows_on_amend(self)
+
 		if not self.get("is_return") and not self.get("is_debit_note"):
 			self.validate_qty_is_not_zero()
 
@@ -224,6 +258,8 @@ class AccountsController(TransactionBase):
 		if self.get("_action") and self._action != "update_after_submit":
 			self.set_missing_values(for_validate=True)
 
+		self.validate_price_list()
+
 		if self.get("_action") == "submit":
 			self.remove_bundle_for_non_stock_invoices()
 
@@ -236,7 +272,9 @@ class AccountsController(TransactionBase):
 			else:
 				from erpnext.accounts.services.deferred_accounting import DeferredAccountingService
 
-				DeferredAccountingService(self).validate_start_and_end_date()
+				deferred_service = DeferredAccountingService(self)
+				deferred_service.clear_stale_deferred_fields()
+				deferred_service.validate_start_and_end_date()
 
 		from erpnext.accounts.services.internal_transfer import InternalTransferService
 
@@ -260,7 +298,8 @@ class AccountsController(TransactionBase):
 			self.calculate_taxes_and_totals()
 
 			if not self.meta.get_field("is_return") or not self.is_return:
-				self.validate_value("base_grand_total", ">=", 0)
+				if not self.is_negative_grand_total_allowed():
+					self.validate_value("base_grand_total", ">=", 0)
 
 			validate_return(self)
 
@@ -308,6 +347,28 @@ class AccountsController(TransactionBase):
 		self.set_total_in_words()
 		self.set_default_letter_head()
 		self.validate_company_in_accounting_dimension()
+
+	def validate_price_list(self):
+		price_list_field = "selling_price_list" if self.get("selling_price_list") else "buying_price_list"
+		price_list = self.get(price_list_field)
+		if not price_list or frappe.db.get_value("Price List", price_list, "enabled"):
+			return
+
+		# Returns retain a submitted voucher's pricing even if its price list is now disabled.
+		if (
+			self.get("is_return")
+			and self.get("return_against")
+			and price_list
+			== frappe.db.get_value(
+				self.doctype, {"name": self.return_against, "docstatus": 1}, price_list_field
+			)
+		):
+			return
+
+		frappe.throw(
+			_("Price List {0} is disabled").format(get_link_to_form("Price List", price_list)),
+			title=_("Disabled Price List"),
+		)
 
 	def set_default_letter_head(self):
 		if hasattr(self, "letter_head") and not self.letter_head:
@@ -504,7 +565,7 @@ class AccountsController(TransactionBase):
 					_(
 						"Please set {0} to {1}, the same account that was used in the original invoice {2}."
 					).format(
-						frappe.bold(_(self.meta.get_label(cr_dr_account_field), context=self.doctype)),
+						frappe.bold(self.meta.get_translated_label(cr_dr_account_field)),
 						frappe.bold(original_account),
 						frappe.bold(self.return_against),
 					)
@@ -515,6 +576,8 @@ class AccountsController(TransactionBase):
 			frappe.throw(_("To Date cannot be before From Date"), title=_("Invalid Auto Repeat Date"))
 
 	def before_print(self, settings=None):
+		self.set_missing_terms()
+
 		if self.doctype in [
 			"Purchase Order",
 			"Sales Order",
@@ -537,6 +600,16 @@ class AccountsController(TransactionBase):
 
 		set_print_templates_for_item_table(self, settings)
 		set_print_templates_for_taxes(self, settings)
+
+	def set_missing_terms(self):
+		if not self.get("tc_name") or self.get("terms"):
+			return
+
+		from erpnext.setup.doctype.terms_and_conditions.terms_and_conditions import (
+			get_terms_and_conditions,
+		)
+
+		self.terms = get_terms_and_conditions(self.tc_name, self.as_dict())
 
 	def calculate_paid_amount(self):
 		if hasattr(self, "is_pos") or hasattr(self, "is_paid"):
@@ -1037,9 +1110,16 @@ class AccountsController(TransactionBase):
 			party_account = self.credit_to
 			dr_or_cr = "debit_in_account_currency"
 
+		from erpnext.accounts.services.exchange_gain_loss import get_exchange_gain_loss_account
+
 		lst = []
 		for d in self.get("advances"):
 			if flt(d.allocated_amount) > 0:
+				is_gain = (
+					flt(d.get("exchange_gain_loss")) > 0
+					if party_type == "Customer"
+					else flt(d.get("exchange_gain_loss")) < 0
+				)
 				args = frappe._dict(
 					{
 						"voucher_type": d.reference_type,
@@ -1066,9 +1146,7 @@ class AccountsController(TransactionBase):
 							else self.grand_total
 						),
 						"outstanding_amount": self.outstanding_amount,
-						"difference_account": frappe.get_cached_value(
-							"Company", self.company, "exchange_gain_loss_account"
-						),
+						"difference_account": get_exchange_gain_loss_account(self.company, is_gain),
 						"exchange_gain_loss": flt(d.get("exchange_gain_loss")),
 						"difference_posting_date": d.get("difference_posting_date"),
 					}

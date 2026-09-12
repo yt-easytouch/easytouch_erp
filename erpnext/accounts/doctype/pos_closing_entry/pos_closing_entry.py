@@ -219,7 +219,8 @@ class POSClosingEntry(StatusUpdater):
 		self.update_sales_invoices_closing_entry()
 
 	def before_cancel(self):
-		self.check_pce_is_cancellable()
+		if self.status != "Failed":
+			self.check_pce_is_cancellable()
 
 	def on_cancel(self):
 		unconsolidate_pos_invoices(closing_entry=self)
@@ -262,12 +263,15 @@ def get_cashiers(doctype: str, txt: str, searchfield: str, start: int, page_len:
 @frappe.whitelist()
 def get_invoices(start: str | datetime, end: str | datetime, pos_profile: str, user: str):
 	invoice_doctype = frappe.db.get_single_value("POS Settings", "invoice_type")
+	frappe.has_permission("POS Profile", doc=pos_profile, throw=True)
 
+	frappe.has_permission("Sales Invoice", throw=True)
 	sales_inv_query = build_invoice_query("Sales Invoice", user, pos_profile, start, end)
 
 	query = sales_inv_query
 
 	if invoice_doctype == "POS Invoice":
+		frappe.has_permission("POS Invoice", throw=True)
 		pos_inv_query = build_invoice_query("POS Invoice", user, pos_profile, start, end)
 		query = query + pos_inv_query
 

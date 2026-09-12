@@ -350,6 +350,10 @@ def get_email_list(company):
 
 
 def get_comapny_wise_users(company):
+	# single company: no explicit permission needed, everyone has access
+	if frappe.db.count("Company") == 1:
+		return []
+
 	companies = [company]
 
 	if parent_company := frappe.db.get_value("Company", company, "parent_company"):
@@ -380,7 +384,7 @@ def notify_errors(exceptions_list):
 			error_message = f"<div class='small text-muted'>{escape_html(str(exception))}</div><br>"
 			content += error_message
 		except Exception:
-			pass
+			frappe.log_error(title="Failed to format auto reorder exception", message=frappe.get_traceback())
 
 	content += _("Regards,") + "<br>" + _("Administrator")
 

@@ -30,7 +30,6 @@ from erpnext.controllers.item_variant import (
 	make_variant_item_code,
 	validate_item_variant_attributes,
 )
-from erpnext.stock.doctype.company_restriction.company_restriction import validate_allowed_companies
 from erpnext.stock.doctype.item_default.item_default import ItemDefault
 from erpnext.stock.serial_batch_bundle import SerialBatchCreation
 from erpnext.stock.utils import get_valuation_method
@@ -133,8 +132,8 @@ class Item(Document):
 		purchase_uom: DF.Link | None
 		quality_inspection_template: DF.Link | None
 		reorder_levels: DF.Table[ItemReorder]
-		retain_sample: DF.Check
 		restrict_to_companies: DF.Check
+		retain_sample: DF.Check
 		safety_stock: DF.Float
 		sales_tax_withholding_category: DF.Link | None
 		sales_uom: DF.Link | None
@@ -220,6 +219,7 @@ class Item(Document):
 		self.validate_conversion_factor()
 		self.validate_item_type()
 		self.validate_naming_series()
+		self.validate_shelf_life()
 		self.check_for_active_boms()
 		self.fill_customer_code()
 		self.check_item_tax()
@@ -246,7 +246,6 @@ class Item(Document):
 		self.validate_serialized_change_with_bundle()
 		self.validate_standard_cost_change()
 		self.validate_item_tax_net_rate_range()
-		validate_allowed_companies(self)
 
 		if not self.is_new():
 			self.old_item_group = frappe.db.get_value(self.doctype, self.name, "item_group")
@@ -274,7 +273,7 @@ class Item(Document):
 					_(
 						'Image in the description has been removed. To disable this behavior, uncheck "{0}" in {1}.'
 					).format(
-						frappe.get_meta("Stock Settings").get_label("clean_description_html"),
+						frappe.get_meta("Stock Settings").get_translated_label("clean_description_html"),
 						get_link_to_form("Stock Settings"),
 					),
 					alert=True,
@@ -293,7 +292,7 @@ class Item(Document):
 		if not price_list:
 			price_list = frappe.get_single_value(
 				"Selling Settings", "selling_price_list"
-			) or frappe.db.get_value("Price List", _("Standard Selling"))
+			) or frappe.db.get_value("Price List", "Standard Selling")
 		if price_list:
 			item_price = frappe.get_doc(
 				{
@@ -323,13 +322,11 @@ class Item(Document):
 		for default in self.item_defaults or [
 			frappe._dict({"company": frappe.defaults.get_defaults().company})
 		]:
-			default_warehouse = default.default_warehouse or frappe.get_single_value(
-				"Stock Settings", "default_warehouse"
-			)
-			if default_warehouse:
-				warehouse_company = frappe.db.get_value("Warehouse", default_warehouse, "company")
+			default_warehouse = default.default_warehouse
+			if not default_warehouse and default.company:
+				default_warehouse = frappe.get_cached_value("Company", default.company, "default_warehouse")
 
-			if not default_warehouse or warehouse_company != default.company:
+			if not default_warehouse:
 				default_warehouse = frappe.db.get_value(
 					"Warehouse", {"warehouse_name": _("Stores"), "company": default.company}
 				)
@@ -391,13 +388,28 @@ class Item(Document):
 				)
 
 	def validate_retain_sample(self):
-		if self.retain_sample and not frappe.get_single_value("Stock Settings", "sample_retention_warehouse"):
-			frappe.throw(_("Please select Sample Retention Warehouse in Stock Settings first"))
+		if self.retain_sample and not frappe.db.exists(
+			"Company", {"sample_retention_warehouse": ("is", "set")}
+		):
+			frappe.throw(_("Please select Sample Retention Warehouse in Company first"))
 		if self.retain_sample and not self.has_batch_no:
 			frappe.throw(
 				_(
 					"{0} Retain Sample is based on batch, please check Has Batch No to retain sample of item"
 				).format(self.item_code)
+			)
+
+	def validate_shelf_life(self):
+		if (
+			self.has_batch_no
+			and self.has_expiry_date
+			and self.create_new_batch
+			and cint(self.shelf_life_in_days) <= 0
+		):
+			frappe.throw(
+				_("{0} must be greater than zero.").format(
+					self.get_label_from_fieldname("shelf_life_in_days")
+				)
 			)
 
 	def clear_retain_sample(self):
@@ -426,8 +438,8 @@ class Item(Document):
 				frappe.throw(
 					_("Taxes row #{0}: {1} cannot be smaller than {2}").format(
 						tax.idx,
-						bold(_(tax.meta.get_label("maximum_net_rate"))),
-						bold(_(tax.meta.get_label("minimum_net_rate"))),
+						bold(tax.meta.get_translated_label("maximum_net_rate")),
+						bold(tax.meta.get_translated_label("minimum_net_rate")),
 					)
 				)
 
@@ -704,7 +716,7 @@ class Item(Document):
 
 		if new_properties != [cstr(self.get(field)) for field in field_list]:
 			msg = _("To merge, following properties must be same for both items")
-			msg += ": \n" + ", ".join([_(self.meta.get_label(fld)) for fld in field_list])
+			msg += ": \n" + ", ".join([self.meta.get_translated_label(fld) for fld in field_list])
 			frappe.throw(msg, title=_("Cannot Merge"), exc=DataValidationError)
 
 	def validate_duplicate_product_bundles_before_merge(self, old_name, new_name):
@@ -862,7 +874,17 @@ class Item(Document):
 				frappe.throw(_("Item {0} is not a template item.").format(frappe.bold(self.variant_of)))
 
 			if based_on == "Item Attribute":
+				previous_doc = self.get_doc_before_save()
+				saved_attributes = (
+					{(row.attribute, row.attribute_value) for row in previous_doc.attributes}
+					if previous_doc
+					else set()
+				)
+
 				for d in self.attributes:
+					if (d.attribute, d.attribute_value) in saved_attributes:
+						continue
+
 					if not frappe.db.exists(
 						"Item Variant Attribute", {"attribute": d.attribute, "parent": self.variant_of}
 					):
@@ -1022,6 +1044,9 @@ class Item(Document):
 	def validate_uom_conversion_factor(self):
 		if self.uoms:
 			for d in self.uoms:
+				if d.conversion_factor:
+					continue
+
 				value = get_uom_conv_factor(d.uom, self.stock_uom)
 				if value:
 					d.conversion_factor = value
@@ -1123,7 +1148,7 @@ class Item(Document):
 			return
 
 		if linked_doc := self._get_linked_submitted_documents(changed_fields):
-			changed_field_labels = [frappe.bold(_(self.meta.get_label(f))) for f in changed_fields]
+			changed_field_labels = [frappe.bold(self.meta.get_translated_label(f)) for f in changed_fields]
 			msg = _(
 				"As there are existing submitted transactions against item {0}, you can not change the value of {1}."
 			).format(self.name, ", ".join(changed_field_labels))
@@ -1499,8 +1524,8 @@ def get_uom_conv_factor(uom: str | None, stock_uom: str | None):
 	inverse_match = frappe.db.get_value(
 		"UOM Conversion Factor", {"to_uom": from_uom, "from_uom": to_uom}, ["value"], as_dict=1
 	)
-	if inverse_match:
-		return 1 / inverse_match.value
+	if inverse_match and inverse_match.value:
+		return flt(1 / inverse_match.value, frappe.get_precision("UOM Conversion Factor", "value"))
 
 	# This attempts to try and get conversion from intermediate UOM.
 	# case:
@@ -1509,18 +1534,34 @@ def get_uom_conv_factor(uom: str | None, stock_uom: str | None):
 	# therefore	 kg -> mg = 1000  / 0.001 = 1,000,000
 	first = frappe.qb.DocType("UOM Conversion Factor").as_("first")
 	second = frappe.qb.DocType("UOM Conversion Factor").as_("second")
-	intermediate_match = (
+	# Conversion pairs are not unique, so document names provide stable tie-breakers.
+	shared_source_match = (
 		frappe.qb.from_(first)
 		.join(second)
 		.on(first.from_uom == second.from_uom)
 		.select((first.value / second.value).as_("value"))
-		.where((first.to_uom == to_uom) & (second.to_uom == from_uom))
+		.where((first.to_uom == to_uom) & (second.to_uom == from_uom) & (second.value != 0))
+		.orderby(first.name, second.name)
 		.limit(1)
 		.run(as_dict=1)
 	)
 
-	if intermediate_match:
-		return intermediate_match[0].value
+	if shared_source_match:
+		return flt(shared_source_match[0].value, frappe.get_precision("UOM Conversion Factor", "value"))
+
+	shared_target_match = (
+		frappe.qb.from_(first)
+		.join(second)
+		.on(first.to_uom == second.to_uom)
+		.select((first.value / second.value).as_("value"))
+		.where((first.from_uom == from_uom) & (second.from_uom == to_uom) & (second.value != 0))
+		.orderby(first.name, second.name)
+		.limit(1)
+		.run(as_dict=1)
+	)
+
+	if shared_target_match:
+		return flt(shared_target_match[0].value, frappe.get_precision("UOM Conversion Factor", "value"))
 
 
 @frappe.whitelist()
@@ -1586,6 +1627,9 @@ def get_child_warehouses(warehouse):
 	return get_child_warehouses(warehouse)
 
 
+ITEM_PRICES_LIMIT = 10
+
+
 @frappe.whitelist()
 def get_item_prices(item_code: str):
 	"""Fetch valid item prices for the item prices tab."""
@@ -1613,14 +1657,13 @@ def get_item_prices(item_code: str):
 		.where(ItemPrice.docstatus != 2)
 		.where((ItemPrice.valid_upto.isnull()) | (ItemPrice.valid_upto >= today))
 		.orderby(ItemPrice.price_list)
-		.limit(11)
+		.limit(ITEM_PRICES_LIMIT + 1)
 		.run(as_dict=True)
 	)
 
-	has_more = len(prices) == 11
 	return {
-		"prices": prices[:10],
-		"has_more": has_more,
+		"prices": prices[:ITEM_PRICES_LIMIT],
+		"has_more": len(prices) > ITEM_PRICES_LIMIT,
 	}
 
 
@@ -1772,11 +1815,8 @@ def get_default_warehouse_for_opening_stock(item, company: str, warehouse: str |
 		if default.company == company and default.default_warehouse:
 			return default.default_warehouse
 
-	settings_warehouse = frappe.get_single_value("Stock Settings", "default_warehouse")
-	if settings_warehouse:
-		warehouse_company = frappe.db.get_value("Warehouse", settings_warehouse, "company")
-		if warehouse_company == company:
-			return settings_warehouse
+	if company_warehouse := frappe.get_cached_value("Company", company, "default_warehouse"):
+		return company_warehouse
 
 	stores_warehouse = frappe.db.get_value("Warehouse", {"warehouse_name": _("Stores"), "company": company})
 
@@ -1785,7 +1825,7 @@ def get_default_warehouse_for_opening_stock(item, company: str, warehouse: str |
 
 	frappe.throw(
 		_(
-			"No warehouse found for company {0}. Please set a Default Warehouse in Item Defaults or Stock Settings."
+			"No warehouse found for company {0}. Please set a Default Warehouse in Item Defaults or Company."
 		).format(frappe.bold(company))
 	)
 

@@ -368,7 +368,6 @@ erpnext.accounts.SalesInvoiceController = class SalesInvoiceController extends (
 		let filters = {
 			docstatus: 1,
 			status: ["not in", ["Closed", "On Hold"]],
-			per_billed: ["<", 99.99],
 			company: me.frm.doc.company,
 		};
 
@@ -387,6 +386,8 @@ erpnext.accounts.SalesInvoiceController = class SalesInvoiceController extends (
 						customer: me.frm.doc.customer || undefined,
 					},
 					get_query_filters: filters,
+					get_query_method:
+						"erpnext.selling.doctype.sales_order.sales_order.get_potentially_billable_sales_orders",
 					allow_child_item_selection: true,
 					child_fieldname: "items",
 					child_columns: ["item_code", "item_name", "qty", "amount", "billed_amt"],
@@ -587,7 +588,12 @@ erpnext.accounts.SalesInvoiceController = class SalesInvoiceController extends (
 		super.set_dynamic_labels();
 		this.frm.events.hide_fields(this.frm);
 		const hide_update_stock = cint(this.frm.doc.is_debit_note) || cint(this.frm.doc.has_subcontracted);
-		this.frm.set_df_property("update_stock", "hidden", hide_update_stock);
+		// frm.set_df_property mutates a per-document copy, not the doctype's shared field
+		// metadata, so this always reflects the original (Customize Form) hidden value.
+		const hidden_by_customization = cint(
+			frappe.meta.get_docfield("Sales Invoice", "update_stock")?.hidden
+		);
+		this.frm.set_df_property("update_stock", "hidden", hide_update_stock || hidden_by_customization);
 	}
 
 	items_on_form_rendered() {

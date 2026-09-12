@@ -85,6 +85,9 @@ def get_bom_diff(bom1: str, bom2: str):
 	doc1 = frappe.get_doc("BOM", bom1)
 	doc2 = frappe.get_doc("BOM", bom2)
 
+	doc1.check_permission()
+	doc2.check_permission()
+
 	out = get_diff(doc1, doc2)
 	out.row_changed, out.added, out.removed = [], [], []
 	for df in doc1.meta.fields:
@@ -158,9 +161,9 @@ def _item_query_filters(filters):
 
 def _item_query_or_filters(txt, searchfields, query_filters):
 	if not txt:
-		return {}
+		return []
 
-	or_filters = {s_field: ("like", f"%{txt}%") for s_field in searchfields}
+	or_filters = [[s_field, "like", f"%{txt}%"] for s_field in searchfields]
 	barcodes = frappe.get_all(
 		"Item Barcode",
 		fields=["parent as item_code"],
@@ -169,7 +172,7 @@ def _item_query_or_filters(txt, searchfields, query_filters):
 	)
 	barcode_codes = [d.item_code for d in barcodes]
 	if barcode_codes:
-		or_filters["name"] = ("in", barcode_codes)
+		or_filters.append(["name", "in", barcode_codes])
 	return or_filters
 
 
@@ -179,7 +182,7 @@ def make_variant_bom(
 	bom_no: str,
 	item: str,
 	variant_items: str | list,
-	target_doc: Document | str | None = None,
+	target_doc: str | dict | Document | None = None,
 ):
 	frappe.has_permission("BOM", "write", throw=True)
 

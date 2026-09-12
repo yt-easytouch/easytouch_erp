@@ -29,29 +29,30 @@ class TestCustomer(ERPNextTestSuite):
 		company_currency = frappe.get_cached_value("Company", company, "default_currency")
 		foreign_currency = "USD" if company_currency != "USD" else "EUR"
 
+		original_company = frappe.defaults.get_user_default("company")
 		frappe.defaults.set_user_default("company", company)
-		self.addCleanup(frappe.defaults.clear_user_default, "company")
+		try:
+			# Master data seeds a current-dated exchange rate, so make_quotation should
+			# resolve that rate instead of falling back to the default conversion rate of 1.0.
+			expected_rate = get_exchange_rate(foreign_currency, company_currency, nowdate())
 
-		# Master data seeds a current-dated exchange rate, so make_quotation should
-		# resolve that rate instead of falling back to the default conversion rate of 1.0.
-		expected_rate = get_exchange_rate(foreign_currency, company_currency, nowdate())
+			customer = frappe.get_doc(
+				{
+					"doctype": "Customer",
+					"customer_name": "_Test Customer FX Quotation",
+					"customer_type": "Company",
+					"default_currency": foreign_currency,
+				}
+			).insert()
 
-		customer = frappe.get_doc(
-			{
-				"doctype": "Customer",
-				"customer_name": "_Test Customer FX Quotation",
-				"customer_type": "Company",
-				"default_currency": foreign_currency,
-			}
-		).insert()
-		self.addCleanup(frappe.delete_doc, "Customer", customer.name, force=1)
+			quotation = make_quotation(customer.name)
 
-		quotation = make_quotation(customer.name)
-
-		self.assertEqual(quotation.currency, foreign_currency)
-		self.assertNotEqual(flt(quotation.conversion_rate), 1.0)
-		self.assertNotEqual(flt(quotation.conversion_rate), 0.0)
-		self.assertEqual(flt(quotation.conversion_rate), flt(expected_rate))
+			self.assertEqual(quotation.currency, foreign_currency)
+			self.assertNotEqual(flt(quotation.conversion_rate), 1.0)
+			self.assertNotEqual(flt(quotation.conversion_rate), 0.0)
+			self.assertEqual(flt(quotation.conversion_rate), flt(expected_rate))
+		finally:
+			frappe.defaults.set_user_default("company", original_company)
 
 	def test_get_customer_name_dedupes_with_numeric_suffix(self):
 		# When a customer name already exists, get_customer_name appends "- <max suffix + 1>". The
@@ -63,7 +64,6 @@ class TestCustomer(ERPNextTestSuite):
 				frappe.get_doc(
 					{"doctype": "Customer", "customer_name": nm, "customer_type": "Individual"}
 				).insert()
-			self.addCleanup(frappe.delete_doc, "Customer", nm, force=1)
 
 		doc = frappe.get_doc({"doctype": "Customer", "customer_name": base, "customer_type": "Individual"})
 		self.assertEqual(doc.get_customer_name(), f"{base} - 4")
@@ -79,7 +79,6 @@ class TestCustomer(ERPNextTestSuite):
 				frappe.get_doc(
 					{"doctype": "Customer", "customer_name": nm, "customer_type": "Individual"}
 				).insert()
-			self.addCleanup(frappe.delete_doc, "Customer", nm, force=1)
 
 		doc = frappe.get_doc({"doctype": "Customer", "customer_name": base, "customer_type": "Individual"})
 		self.assertEqual(doc.get_customer_name(), f"{base} - 4")
@@ -438,6 +437,37 @@ class TestCustomer(ERPNextTestSuite):
 		pe.submit()
 		self.assertEqual(get_customer_overdue_amount("_Test Customer", "_Test Company"), baseline)
 
+	def test_get_customer_overdue_amount_ignores_advance_reconciled_after_submit(self):
+		from erpnext.accounts.doctype.payment_entry.test_payment_entry import create_payment_entry
+		from erpnext.accounts.doctype.sales_invoice.test_sales_invoice import create_sales_invoice
+
+		baseline = get_customer_overdue_amount("_Test Customer", "_Test Company")
+
+		# advance received before the invoice exists, so it carries no reference row
+		pe = create_payment_entry(
+			company="_Test Company",
+			party_type="Customer",
+			party="_Test Customer",
+			payment_type="Receive",
+			paid_from="Debtors - _TC",
+			paid_to="Cash - _TC",
+			paid_amount=800,
+		)
+		pe.posting_date = add_days(nowdate(), -60)
+		pe.submit()
+
+		si = create_sales_invoice(qty=1, rate=800, posting_date=add_days(nowdate(), -30))
+		self.assertEqual(get_customer_overdue_amount("_Test Customer", "_Test Company"), baseline + 800)
+
+		reconcile_payment_against_invoice(pe, si)
+
+		# reconciliation settles the invoice without re-tagging the payment's GL entries, so an
+		# overdue amount read off the GL would still count the full 800 here
+		si.reload()
+		self.assertEqual(si.outstanding_amount, 0)
+		self.assertEqual(si.status, "Paid")
+		self.assertEqual(get_customer_overdue_amount("_Test Customer", "_Test Company"), baseline)
+
 	def test_overdue_billing_threshold_on_submit(self):
 		from erpnext.accounts.doctype.sales_invoice.test_sales_invoice import create_sales_invoice
 
@@ -445,33 +475,41 @@ class TestCustomer(ERPNextTestSuite):
 		overdue = get_customer_overdue_amount("_Test Customer", "_Test Company")
 
 		settings = frappe.get_single("Accounts Settings")
-		settings.enable_overdue_billing_threshold = 1
-		settings.role_allowed_to_bypass_overdue_billing = None
-		settings.save()
-		set_overdue_billing_threshold("_Test Customer", "_Test Company", overdue - 100)
+		original_enable = settings.enable_overdue_billing_threshold
+		original_bypass_role = settings.role_allowed_to_bypass_overdue_billing
+		try:
+			settings.enable_overdue_billing_threshold = 1
+			settings.role_allowed_to_bypass_overdue_billing = None
+			settings.save()
+			set_overdue_billing_threshold("_Test Customer", "_Test Company", overdue - 100)
 
-		# overdue is over the threshold and the user has no bypass role -> blocked
-		si = create_sales_invoice(do_not_submit=True)
-		self.assertRaises(frappe.ValidationError, si.submit)
+			# overdue is over the threshold and the user has no bypass role -> blocked
+			si = create_sales_invoice(do_not_submit=True)
+			self.assertRaises(frappe.ValidationError, si.submit)
 
-		# a user holding the bypass role can still submit
-		settings.role_allowed_to_bypass_overdue_billing = "Accounts Manager"
-		settings.save()
-		si = create_sales_invoice(do_not_submit=True)
-		si.submit()
-		self.assertEqual(si.docstatus, 1)
+			# a user holding the bypass role can still submit
+			settings.role_allowed_to_bypass_overdue_billing = "Accounts Manager"
+			settings.save()
+			si = create_sales_invoice(do_not_submit=True)
+			si.submit()
+			self.assertEqual(si.docstatus, 1)
 
-		# threshold still crossed, but the feature is off -> never blocked
-		settings.enable_overdue_billing_threshold = 0
-		settings.role_allowed_to_bypass_overdue_billing = None
-		settings.save()
-		si = create_sales_invoice(do_not_submit=True)
-		si.submit()
-		self.assertEqual(si.docstatus, 1)
+			# threshold still crossed, but the feature is off -> never blocked
+			settings.enable_overdue_billing_threshold = 0
+			settings.role_allowed_to_bypass_overdue_billing = None
+			settings.save()
+			si = create_sales_invoice(do_not_submit=True)
+			si.submit()
+			self.assertEqual(si.docstatus, 1)
+		finally:
+			settings.enable_overdue_billing_threshold = original_enable
+			settings.role_allowed_to_bypass_overdue_billing = original_bypass_role
+			settings.save()
 
 	def test_overdue_billing_threshold_falls_back_to_customer_group(self):
 		customer_group = frappe.get_cached_value("Customer", "_Test Customer", "customer_group")
 		group = frappe.get_doc("Customer Group", customer_group)
+
 		group.credit_limits = []
 		group.append("credit_limits", {"company": "_Test Company", "overdue_billing_threshold": 5000})
 		group.save()
@@ -482,6 +520,10 @@ class TestCustomer(ERPNextTestSuite):
 		# a threshold on the customer wins over the group
 		set_overdue_billing_threshold("_Test Customer", "_Test Company", 2000)
 		self.assertEqual(get_overdue_billing_threshold("_Test Customer", "_Test Company"), 2000)
+
+		# a 0 on the customer inherits the group's limit
+		set_overdue_billing_threshold("_Test Customer", "_Test Company", 0)
+		self.assertEqual(get_overdue_billing_threshold("_Test Customer", "_Test Company"), 5000)
 
 	def test_overdue_threshold_row_without_credit_limit(self):
 		from erpnext.accounts.doctype.sales_invoice.test_sales_invoice import create_sales_invoice
@@ -603,6 +645,27 @@ def set_credit_limit(customer, company, credit_limit):
 	if not existing_row:
 		customer.append("credit_limits", {"company": company, "credit_limit": credit_limit})
 		customer.credit_limits[-1].db_insert()
+
+
+def reconcile_payment_against_invoice(payment_entry, sales_invoice):
+	"""Allocate an unlinked payment against an invoice through the reconciliation tool."""
+	pr = frappe.get_doc(
+		doctype="Payment Reconciliation",
+		company=sales_invoice.company,
+		party_type="Customer",
+		party=sales_invoice.customer,
+		receivable_payable_account=sales_invoice.debit_to,
+	)
+	pr.get_unreconciled_entries()
+	pr.allocate_entries(
+		frappe._dict(
+			{
+				"invoices": [d.as_dict() for d in pr.invoices if d.invoice_number == sales_invoice.name],
+				"payments": [d.as_dict() for d in pr.payments if d.reference_name == payment_entry.name],
+			}
+		)
+	)
+	pr.reconcile()
 
 
 def set_overdue_billing_threshold(customer, company, threshold):

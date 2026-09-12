@@ -154,6 +154,9 @@ class Quotation(SellingController):
 
 		make_packing_list(self)
 
+	def after_insert(self):
+		self.carry_forward_communication()
+
 	def before_submit(self):
 		self.set_has_alternative_item()
 
@@ -264,6 +267,8 @@ class Quotation(SellingController):
 	def declare_enquiry_lost(
 		self, lost_reasons_list: list, competitors: list, detailed_reason: str | None = None
 	):
+		self.check_permission("write")
+
 		if not (self.is_fully_ordered() or self.is_partially_ordered()):
 			get_lost_reasons = frappe.get_list("Quotation Lost Reason", fields=["name"])
 			lost_reasons_lst = [reason.get("name") for reason in get_lost_reasons]
@@ -311,6 +316,18 @@ class Quotation(SellingController):
 		self.set_status(update=True)
 		self.update_opportunity("Open")
 		self.update_lead()
+
+	def carry_forward_communication(self):
+		from erpnext.crm.utils import copy_comments, link_communications
+
+		if not (
+			self.opportunity
+			and frappe.get_single_value("CRM Settings", "carry_forward_communication_and_comments")
+		):
+			return
+
+		copy_comments("Opportunity", self.opportunity, self)
+		link_communications("Opportunity", self.opportunity, self)
 
 	def print_other_charges(self, docname):
 		print_lst = []

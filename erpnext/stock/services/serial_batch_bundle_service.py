@@ -32,25 +32,37 @@ class SerialBatchBundleService:
 		self.doc = doc
 
 	def validate_warehouse_of_sabb(self):
-		if self.doc.is_internal_transfer():
-			return
-
+		is_internal_transfer = self.doc.is_internal_transfer()
 		doc_before_save = self.doc.get_doc_before_save()
+		bundle_details = {}
 
 		for row in self.doc.items:
-			if not row.get("serial_and_batch_bundle"):
-				continue
+			for fieldname in ("serial_and_batch_bundle", "rejected_serial_and_batch_bundle"):
+				bundle = row.get(fieldname)
+				if not bundle:
+					continue
 
-			sabb_details = frappe.db.get_value(
-				"Serial and Batch Bundle",
-				row.serial_and_batch_bundle,
-				["type_of_transaction", "warehouse", "has_serial_no"],
-				as_dict=True,
-			)
+				if bundle not in bundle_details:
+					bundle_details[bundle] = frappe.db.get_value(
+						"Serial and Batch Bundle",
+						bundle,
+						["company", "type_of_transaction", "warehouse", "has_serial_no"],
+						as_dict=True,
+					)
+
+				sabb_details = bundle_details[bundle]
+				if sabb_details and sabb_details.company != self.doc.company:
+					frappe.throw(
+						_(
+							"Row #{0}: Company {1} does not match with the company {2} in Serial and Batch Bundle {3}."
+						).format(row.idx, self.doc.company, sabb_details.company, bundle)
+					)
+
+			sabb_details = bundle_details.get(row.get("serial_and_batch_bundle"))
 			if not sabb_details:
 				continue
 
-			if sabb_details.type_of_transaction != "Outward":
+			if is_internal_transfer or sabb_details.type_of_transaction != "Outward":
 				continue
 
 			warehouse = row.get("warehouse") or row.get("s_warehouse")
@@ -630,8 +642,9 @@ class SerialBatchBundleService:
 			if outstanding > 0:
 				reservations[key].append(row)
 
+		precision = frappe.get_precision("Serial and Batch Entry", "qty")
 		for (batch_no, warehouse), reserved_qty in outstanding_qty.items():
-			if flt(reserved_qty, 6) <= 0:
+			if flt(reserved_qty, precision) <= 0:
 				continue
 
 			batch_qty = get_batch_qty(
@@ -642,7 +655,7 @@ class SerialBatchBundleService:
 				consider_negative_batches=True,
 			)
 
-			if flt(batch_qty, 6) >= flt(reserved_qty, 6):
+			if flt(batch_qty, precision) >= flt(reserved_qty, precision):
 				continue
 
 			vouchers = ", ".join(

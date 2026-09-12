@@ -11,6 +11,7 @@ from frappe.utils import cint, flt, getdate, nowdate
 import erpnext
 from erpnext.assets.doctype.asset.asset import get_asset_account, is_cwip_accounting_enabled
 from erpnext.controllers.buying_controller import BuyingController
+from erpnext.controllers.item_close import validate_parent_reopen
 from erpnext.stock.doctype.purchase_receipt.services.billing_status import BillingStatusService
 from erpnext.stock.doctype.purchase_receipt.services.provisional_accounting import (
 	ProvisionalAccountingService,
@@ -257,7 +258,7 @@ class PurchaseReceipt(BuyingController):
 		self.validate_cwip_accounts()
 		ProvisionalAccountingService(self).validate_provisional_expense_account()
 
-		self.check_for_on_hold_or_closed_status("Purchase Order", "purchase_order")
+		self.check_purchase_order_on_hold_or_close("purchase_order")
 
 		if getdate(self.posting_date) > getdate(nowdate()):
 			throw(_("Posting Date cannot be a future date"))
@@ -423,31 +424,10 @@ class PurchaseReceipt(BuyingController):
 						row.received_qty,
 					)
 
-	def check_next_docstatus(self):
-		submit_rv = frappe.get_all(
-			"Purchase Invoice Item",
-			filters={"purchase_receipt": self.name, "docstatus": 1},
-			fields=["parent"],
-			as_list=True,
-			limit=1,
-		)
-		if submit_rv:
-			frappe.throw(_("Purchase Invoice {0} is already submitted").format(submit_rv[0][0]))
-
 	def on_cancel(self):
 		super().on_cancel()
 
-		self.check_for_on_hold_or_closed_status("Purchase Order", "purchase_order")
-		# Check if Purchase Invoice has been submitted against current Purchase Order
-		submitted = frappe.get_all(
-			"Purchase Invoice Item",
-			filters={"purchase_receipt": self.name, "docstatus": 1},
-			fields=["parent"],
-			as_list=True,
-			limit=1,
-		)
-		if submitted:
-			frappe.throw(_("Purchase Invoice {0} is already submitted").format(submitted[0][0]))
+		self.check_purchase_order_on_hold_or_close("purchase_order")
 
 		self.update_prevdoc_status()
 		self.update_billing_status()
@@ -519,9 +499,15 @@ class PurchaseReceipt(BuyingController):
 			)
 
 	def update_status(self, status):
+		if status != "Closed" and self.status == "Closed":
+			validate_parent_reopen(self)
+
 		self.set_status(update=True, status=status)
 		self.notify_update()
 		clear_doctype_notifications(self)
+
+	def on_item_close_status_change(self):
+		self.update_billing_status()
 
 	def update_billing_status(self, update_modified=True):
 		BillingStatusService(self).update_billing_status(update_modified)

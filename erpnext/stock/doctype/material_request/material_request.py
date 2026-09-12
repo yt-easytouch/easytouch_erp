@@ -18,6 +18,7 @@ from frappe.utils import cint, flt, get_datetime, get_link_to_form, getdate, new
 from erpnext.buying.utils import check_on_hold_or_closed_status, validate_for_items
 from erpnext.controllers.buying_controller import BuyingController
 from erpnext.manufacturing.doctype.work_order.work_order import get_item_details
+from erpnext.stock.doctype.price_list.price_list import is_price_list_enabled
 from erpnext.stock.get_item_details import get_price_list_rate_for
 from erpnext.stock.stock_balance import get_indented_qty, update_bin_qty
 
@@ -112,6 +113,22 @@ class MaterialRequest(BuyingController):
 	def check_if_already_pulled(self):
 		pass
 
+	def validate_with_previous_doc(self):
+		super().validate_with_previous_doc(
+			{
+				"Sales Order": {
+					"ref_dn_field": "sales_order",
+					"compare_fields": [["company", "="]],
+				},
+				"Sales Order Item": {
+					"ref_dn_field": "sales_order_item",
+					"compare_fields": [["item_code", "="], ["uom", "="], ["conversion_factor", "="]],
+					"is_child_table": True,
+					"allow_duplicate_prev_row_id": True,
+				},
+			}
+		)
+
 	def validate_qty_against_so(self):
 		so_items = {}  # Format --> {'SO/00001': {'Item/001': 120, 'Item/002': 24}}
 		for d in self.get("items"):
@@ -157,6 +174,7 @@ class MaterialRequest(BuyingController):
 
 		self.validate_schedule_date()
 		self.check_for_on_hold_or_closed_status("Sales Order", "sales_order")
+		self.validate_with_previous_doc()
 		self.validate_uom_is_integer("uom", "qty")
 		self.validate_material_request_type()
 
@@ -192,14 +210,20 @@ class MaterialRequest(BuyingController):
 		self.reset_default_field_value("set_from_warehouse", "items", "from_warehouse")
 
 		self.validate_pp_qty()
+		self.set_buying_price_list()
 
-		if self.buying_price_list and not frappe.get_value("Price List", self.buying_price_list, "buying"):
+	def set_buying_price_list(self):
+		if not is_valid_buying_price_list(self.buying_price_list):
 			self.buying_price_list = None
 
-		if not self.buying_price_list:
-			buying_price_list = frappe.defaults.get_defaults().buying_price_list
-			if frappe.has_permission("Price List", "read", buying_price_list):
-				self.buying_price_list = buying_price_list
+		if self.buying_price_list:
+			return
+
+		default_price_list = frappe.defaults.get_defaults().buying_price_list
+		if is_valid_buying_price_list(default_price_list) and frappe.has_permission(
+			"Price List", "read", default_price_list
+		):
+			self.buying_price_list = default_price_list
 
 	def on_update(self):
 		if not self.is_new() and self.buying_price_list and self.has_value_changed("buying_price_list"):
@@ -273,6 +297,7 @@ class MaterialRequest(BuyingController):
 	def on_submit(self):
 		self.update_requested_qty_in_production_plan()
 		self.update_requested_qty()
+		self.update_requested_qty_in_work_order()
 		if self.material_request_type == "Purchase":
 			self.update_prevdoc_status()
 			if frappe.db.exists("Budget", {"applicable_on_material_request": 1, "docstatus": 1}):
@@ -283,6 +308,20 @@ class MaterialRequest(BuyingController):
 
 	def before_submit(self):
 		self.set_status(update=True)
+		self.validate_pending_qty_in_work_order()
+
+	def validate_pending_qty_in_work_order(self):
+		if not self.work_order or self.material_request_type != "Material Transfer":
+			return
+
+		from erpnext.manufacturing.doctype.work_order.services.required_items import RequiredItemsService
+
+		work_order = frappe.get_doc("Work Order", self.work_order, for_update=True)
+		incoming = {}
+		for row in self.items:
+			incoming[row.item_code] = incoming.get(row.item_code, 0.0) + flt(row.stock_qty)
+
+		RequiredItemsService(work_order).validate_incoming_material_demand(incoming)
 
 	def before_cancel(self):
 		# if MRQ is already closed, no point saving the document
@@ -301,6 +340,7 @@ class MaterialRequest(BuyingController):
 		self.status_can_change(status)
 		self.set_status(update=True, status=status)
 		self.update_requested_qty()
+		self.update_requested_qty_in_work_order()
 
 	def status_can_change(self, status):
 		"""
@@ -330,6 +370,7 @@ class MaterialRequest(BuyingController):
 	def on_cancel(self):
 		self.update_requested_qty_in_production_plan(cancel=True)
 		self.update_requested_qty()
+		self.update_requested_qty_in_work_order()
 		if self.material_request_type == "Purchase":
 			self.update_prevdoc_status()
 
@@ -417,6 +458,19 @@ class MaterialRequest(BuyingController):
 			update_modified,
 		)
 
+		self.update_requested_qty_in_work_order()
+
+	def update_requested_qty_in_work_order(self):
+		"""Refresh both counters: stop and cancel also flip pick list coverage."""
+		if not self.work_order or self.material_request_type != "Material Transfer":
+			return
+
+		from erpnext.manufacturing.doctype.work_order.services.required_items import RequiredItemsService
+
+		service = RequiredItemsService(frappe.get_doc("Work Order", self.work_order))
+		service.update_requested_qty_for_required_items()
+		service.update_picked_qty_for_required_items()
+
 	def update_requested_qty(self, mr_item_rows=None):
 		"""update requested qty (before ordered_qty is updated)"""
 		item_wh_list = []
@@ -455,8 +509,13 @@ class MaterialRequest(BuyingController):
 
 		for production_plan in production_plans:
 			doc = frappe.get_doc("Production Plan", production_plan)
+			doc.flags.ignore_permissions = True
 			doc.set_status()
 			doc.db_set("status", doc.status)
+
+
+def is_valid_buying_price_list(price_list: str | None) -> bool:
+	return is_price_list_enabled(price_list) and bool(frappe.get_value("Price List", price_list, "buying"))
 
 
 def update_completed_and_requested_qty(stock_entry, method):

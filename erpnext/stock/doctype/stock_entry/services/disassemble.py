@@ -2,7 +2,7 @@ from collections import defaultdict
 
 import frappe
 from frappe import _
-from frappe.query_builder.functions import Max, Min, NullIf, Sum
+from frappe.query_builder.functions import Min, NullIf, Sum
 from frappe.utils import flt
 
 from erpnext.stock.doctype.serial_no.serial_no import get_serial_nos
@@ -230,7 +230,7 @@ class DisassembleStockEntry(BaseStockEntry):
 			"t_warehouse": t_warehouse,
 			"is_finished_item": source_row.is_finished_item,
 			"secondary_item_type": source_row.secondary_item_type,
-			"is_legacy_scrap_item": source_row.is_legacy_scrap_item,
+			"valuation_type": source_row.valuation_type,
 			"bom_secondary_item": source_row.bom_secondary_item,
 			"bom_no": source_row.bom_no,
 			"use_serial_batch_fields": 1 if (source_row.batch_no or source_row.serial_no) else 0,
@@ -284,7 +284,7 @@ class DisassembleStockEntry(BaseStockEntry):
 			for field in fields:
 				item_args[field] = row.get(field)
 
-			item_args["is_legacy_scrap_item"] = row.get("is_legacy")
+			item_args["valuation_type"] = row.get("valuation_type")
 			item_args["s_warehouse"] = self.doc.from_warehouse
 			item_args["uom"] = item_args.get("uom") or item_args.get("stock_uom")
 			item_args["bom_secondary_item"] = row.get("name")
@@ -330,7 +330,7 @@ class DisassembleStockEntry(BaseStockEntry):
 			SED.conversion_factor,
 			SED.is_finished_item,
 			SED.secondary_item_type,
-			SED.is_legacy_scrap_item,
+			SED.valuation_type,
 			SED.bom_secondary_item,
 			SED.batch_no,
 			SED.serial_no,
@@ -348,35 +348,16 @@ class DisassembleStockEntry(BaseStockEntry):
 				.run(as_dict=True)
 			)
 
-		# Aggregating across all Manufacture entries of the work order, one row per item_code.
-		# The non-grouped columns are constant per item_code in practice (an item plays one role with
-		# one uom/warehouse across the WO's manufacture entries); Max() keeps the GROUP BY valid on
-		# postgres while returning the value MySQL picked arbitrarily, preserving the one-row-per-item
-		# shape the disassembly expects.
-		return (
+		# Aggregate in stock UOM: qty is expressed in each row's selected UOM and cannot be added
+		# when manufacture entries use different UOMs for the same item. basic_rate is also per
+		# stock UOM, so weight it by transfer_qty. Manufacture rows always carry positive stock
+		# qty, so NullIf only guards a theoretical /0.
+		rows = (
 			query.select(
-				Sum(SED.qty).as_("qty"),
-				Sum(SED.transfer_qty).as_("transfer_qty"),
 				SED.item_code,
-				Max(SED.item_name).as_("item_name"),
-				Max(SED.description).as_("description"),
-				Max(SED.stock_uom).as_("stock_uom"),
-				Max(SED.uom).as_("uom"),
-				# qty-weighted average so consolidating an item across manufacture entries at different
-				# valuation rates values the summed qty correctly (Max would bias the rate high).
-				# Manufacture rows always carry positive qty, so NullIf only guards a theoretical /0.
-				(Sum(SED.basic_rate * SED.qty) / NullIf(Sum(SED.qty), 0)).as_("basic_rate"),
-				Max(SED.conversion_factor).as_("conversion_factor"),
-				Max(SED.is_finished_item).as_("is_finished_item"),
-				Max(SED.secondary_item_type).as_("secondary_item_type"),
-				Max(SED.is_legacy_scrap_item).as_("is_legacy_scrap_item"),
-				Max(SED.bom_secondary_item).as_("bom_secondary_item"),
-				Max(SED.batch_no).as_("batch_no"),
-				Max(SED.serial_no).as_("serial_no"),
-				Max(SED.use_serial_batch_fields).as_("use_serial_batch_fields"),
-				Max(SED.s_warehouse).as_("s_warehouse"),
-				Max(SED.t_warehouse).as_("t_warehouse"),
-				Max(SED.bom_no).as_("bom_no"),
+				Sum(SED.transfer_qty).as_("qty"),
+				Sum(SED.transfer_qty).as_("transfer_qty"),
+				(Sum(SED.basic_rate * SED.transfer_qty) / NullIf(Sum(SED.transfer_qty), 0)).as_("basic_rate"),
 			)
 			.where(SE.purpose == "Manufacture")
 			.where(SE.work_order == self.doc.work_order)
@@ -384,6 +365,61 @@ class DisassembleStockEntry(BaseStockEntry):
 			.orderby(Min(SED.idx))
 			.run(as_dict=True)
 		)
+
+		representative = self.get_representative_manufacture_rows()
+		for row in rows:
+			row.update(representative.get(row.item_code) or {})
+			row.uom = row.stock_uom
+			row.conversion_factor = 1
+
+		return rows
+
+	def get_representative_manufacture_rows(self):
+		"""Earliest posted line per item across the work order's Manufacture entries.
+
+		The disassembly wants one row per item, but some descriptive columns describe a line, not
+		an item: batch_no and serial_no only mean something beside their warehouse, and
+		is_finished_item decides whether the row is the output or an input. Aggregating each column
+		on its own can pair values from different lines into a row that was never posted, so take
+		the columns from a single real line instead. UOM is normalized separately to stock UOM.
+		"""
+		SE = frappe.qb.DocType("Stock Entry")
+		SED = frappe.qb.DocType("Stock Entry Detail")
+
+		lines = (
+			frappe.qb.from_(SED)
+			.join(SE)
+			.on(SED.parent == SE.name)
+			.select(
+				SED.item_code,
+				SED.item_name,
+				SED.description,
+				SED.stock_uom,
+				SED.is_finished_item,
+				SED.secondary_item_type,
+				SED.valuation_type,
+				SED.bom_secondary_item,
+				SED.batch_no,
+				SED.serial_no,
+				SED.use_serial_batch_fields,
+				SED.s_warehouse,
+				SED.t_warehouse,
+				SED.bom_no,
+			)
+			.where(
+				(SE.docstatus == 1) & (SE.purpose == "Manufacture") & (SE.work_order == self.doc.work_order)
+			)
+			.orderby(SE.creation)
+			.orderby(SE.name)
+			.orderby(SED.idx)
+			.run(as_dict=True)
+		)
+
+		representative = {}
+		for line in lines:
+			representative.setdefault(line.item_code, line)
+
+		return representative
 
 	def on_submit(self):
 		self.set_serial_batch_for_disassembly()

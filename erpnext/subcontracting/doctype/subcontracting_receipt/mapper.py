@@ -16,7 +16,7 @@ def make_subcontract_return_against_rejected_warehouse(source_name: str):
 
 
 @frappe.whitelist()
-def make_subcontract_return(source_name: str, target_doc: Document | str | None = None):
+def make_subcontract_return(source_name: str, target_doc: str | dict | Document | None = None):
 	from erpnext.controllers.sales_and_purchase_return import make_return_doc
 
 	return make_return_doc("Subcontracting Receipt", source_name, target_doc)
@@ -25,7 +25,7 @@ def make_subcontract_return(source_name: str, target_doc: Document | str | None 
 @frappe.whitelist(methods=["POST"])
 def make_purchase_receipt(
 	source_name: Document | str,
-	target_doc: Document | str | None = None,
+	target_doc: str | dict | Document | None = None,
 	save: bool = False,
 	submit: bool = False,
 	notify: bool = False,
@@ -113,6 +113,8 @@ def make_purchase_receipt(
 			"Purchase Taxes and Charges": {
 				"doctype": "Purchase Taxes and Charges",
 				"reset_value": True,
+				# for POs created in earlier version with tax_withholding_row
+				"condition": lambda doc: not doc.is_tax_withholding_account,
 			},
 		},
 		postprocess=post_process,

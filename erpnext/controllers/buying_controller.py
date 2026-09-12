@@ -84,18 +84,10 @@ class BuyingController(SubcontractingController):
 				),
 			)
 
-		if (
-			self.get("company")
-			and (
-				default_buying_terms := frappe.get_value(
-					"Company", self.get("company"), "default_buying_terms"
-				)
-			)
-			and not self.get("tc_name")
-			and not self.get("terms")
-		):
-			self.tc_name = default_buying_terms
-			self.terms = frappe.get_value("Terms and Conditions", self.get("tc_name"), "terms")
+		if self.get("company") and not self.get("terms"):
+			if not self.get("tc_name"):
+				self.tc_name = frappe.get_value("Company", self.company, "default_buying_terms")
+			self.set_missing_terms()
 
 	def validate_posting_date_with_po(self):
 		po_list = {x.purchase_order for x in self.items if x.purchase_order}
@@ -304,8 +296,8 @@ class BuyingController(SubcontractingController):
 				frappe.throw(
 					_("Row #{idx}: {from_warehouse_field} and {to_warehouse_field} cannot be same.").format(
 						idx=item.idx,
-						from_warehouse_field=_(item.meta.get_label("from_warehouse")),
-						to_warehouse_field=_(item.meta.get_label("warehouse")),
+						from_warehouse_field=item.meta.get_translated_label("from_warehouse"),
+						to_warehouse_field=item.meta.get_translated_label("warehouse"),
 					)
 				)
 
@@ -338,9 +330,6 @@ class BuyingController(SubcontractingController):
 			if not details.get(field):
 				details[field] = frappe.get_cached_value("Company", self.company, field)
 
-		if not any(details.get(field) for field in fields):
-			return None
-
 		for field in fields:
 			if not details.get(field):
 				frappe.throw(
@@ -358,12 +347,26 @@ class BuyingController(SubcontractingController):
 		if self.doctype == "Purchase Invoice" and not self.update_stock:
 			return
 
+		stock_items = self.get_stock_items()
+
 		for row in self.items:
+			# A service item holds no stock value, so there is nothing to book against it - and it
+			# must not make the expense accounts mandatory either.
+			if row.item_code not in stock_items:
+				continue
+
 			details = self.get_validated_purchase_expense_details(row.item_code)
 			if not details:
 				continue
 
 			amount = flt(row.valuation_rate * row.stock_qty, row.precision("base_amount"))
+			if row.landed_cost_voucher_amount:
+				amount -= flt(row.landed_cost_voucher_amount, row.precision("base_amount"))
+
+			if not amount:
+				# GL Entry rejects a row with neither a debit nor a credit.
+				continue
+
 			self.add_gl_entry(
 				gl_entries=gl_entries,
 				account=details.purchase_expense_account,
@@ -455,7 +458,7 @@ class BuyingController(SubcontractingController):
 					self.precision("item_tax_amount", item),
 				)
 
-				self.round_floats_in(item)
+				self.round_floats_in(item, do_not_round_fields=["conversion_factor"])
 				if flt(item.conversion_factor) == 0.0:
 					item.conversion_factor = (
 						get_conversion_factor(item.item_code, item.uom).get("conversion_factor") or 1.0
@@ -699,7 +702,7 @@ class BuyingController(SubcontractingController):
 					frappe.throw(
 						_("Row #{idx}: {field_label} is mandatory.").format(
 							idx=d.idx,
-							field_label=_(d.meta.get_label("conversion_factor")),
+							field_label=d.meta.get_translated_label("conversion_factor"),
 						)
 					)
 				d.stock_qty = flt(d.qty) * flt(d.conversion_factor)
@@ -746,7 +749,7 @@ class BuyingController(SubcontractingController):
 				frappe.throw(
 					_("Row #{idx}: {field_label} can not be negative for item {item_code}.").format(
 						idx=item_row["idx"],
-						field_label=_(frappe.get_meta(item_row.doctype).get_label(fieldname)),
+						field_label=frappe.get_meta(item_row.doctype).get_translated_label(fieldname),
 						item_code=frappe.bold(item_row["item_code"]),
 					)
 				)
@@ -918,6 +921,13 @@ class BuyingController(SubcontractingController):
 			item.serial_and_batch_bundle, warehouse, type_of_transaction=type_of_transaction
 		)
 
+	def check_purchase_order_on_hold_or_close(self, ref_fieldname, exclude_if_field=None):
+		if self.get("is_return"):
+			return
+		self.check_for_on_hold_or_closed_status(
+			"Purchase Order", ref_fieldname, exclude_if_field=exclude_if_field
+		)
+
 	def update_ordered_and_reserved_qty(self):
 		po_map = {}
 		for d in self.get("items"):
@@ -931,7 +941,7 @@ class BuyingController(SubcontractingController):
 			if po and po_item_rows:
 				po_obj = frappe.get_lazy_doc("Purchase Order", po)
 
-				if po_obj.status in ["Closed", "Cancelled"]:
+				if po_obj.status == "Cancelled" or (po_obj.status == "Closed" and not self.get("is_return")):
 					frappe.throw(
 						_("{doctype} {name} is cancelled or closed.").format(
 							doctype=frappe.bold(_("Purchase Order")),
@@ -1192,14 +1202,14 @@ class BuyingController(SubcontractingController):
 					frappe.throw(
 						_("Row #{idx}: {schedule_date} cannot be before {transaction_date}.").format(
 							idx=d.idx,
-							schedule_date=_(self.meta.get_label("schedule_date")),
-							transaction_date=_(self.meta.get_label("transaction_date")),
+							schedule_date=self.meta.get_translated_label("schedule_date"),
+							transaction_date=self.meta.get_translated_label("transaction_date"),
 						)
 					)
 		else:
 			frappe.throw(
 				_("Please enter the {schedule_date}.").format(
-					schedule_date=_(self.meta.get_label("schedule_date"))
+					schedule_date=self.meta.get_translated_label("schedule_date")
 				)
 			)
 

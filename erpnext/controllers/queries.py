@@ -6,7 +6,7 @@ import json
 from collections import OrderedDict, defaultdict
 
 import frappe
-from frappe import qb, scrub
+from frappe import _, qb, scrub
 from frappe.permissions import has_permission
 from frappe.query_builder import Case, Criterion, DocType
 from frappe.query_builder.functions import (
@@ -25,6 +25,7 @@ from pypika import Order
 
 import erpnext
 from erpnext.accounts.utils import build_qb_match_conditions
+from erpnext.stock.doctype.company_restriction.company_restriction import get_restriction_criterion
 from erpnext.stock.get_item_details import _get_item_tax_template
 from erpnext.stock.utils import get_combine_datetime
 from erpnext.utilities.query import get_filter_conditions_qb
@@ -72,14 +73,17 @@ def employee_query(
 		.where(Criterion.any(search_conditions))
 		.orderby(
 			Case()
-			.when(Locate(txt_no_percent, Employee.name) > 0, Locate(txt_no_percent, Employee.name))
+			.when(
+				Locate(Lower(txt_no_percent), Lower(Employee.name)) > 0,
+				Locate(Lower(txt_no_percent), Lower(Employee.name)),
+			)
 			.else_(99999)
 		)
 		.orderby(
 			Case()
 			.when(
-				Locate(txt_no_percent, Employee.employee_name) > 0,
-				Locate(txt_no_percent, Employee.employee_name),
+				Locate(Lower(txt_no_percent), Lower(Employee.employee_name)) > 0,
+				Locate(Lower(txt_no_percent), Lower(Employee.employee_name)),
 			)
 			.else_(99999)
 		)
@@ -136,16 +140,27 @@ def lead_query(
 		.where(Lead.status.isnull() | (Lead.status != "Converted"))
 		.where(Criterion.any(search_conditions))
 		.orderby(
-			Case().when(Locate(txt_no_percent, Lead.name) > 0, Locate(txt_no_percent, Lead.name)).else_(99999)
-		)
-		.orderby(
 			Case()
-			.when(Locate(txt_no_percent, Lead.lead_name) > 0, Locate(txt_no_percent, Lead.lead_name))
+			.when(
+				Locate(Lower(txt_no_percent), Lower(Lead.name)) > 0,
+				Locate(Lower(txt_no_percent), Lower(Lead.name)),
+			)
 			.else_(99999)
 		)
 		.orderby(
 			Case()
-			.when(Locate(txt_no_percent, Lead.company_name) > 0, Locate(txt_no_percent, Lead.company_name))
+			.when(
+				Locate(Lower(txt_no_percent), Lower(Lead.lead_name)) > 0,
+				Locate(Lower(txt_no_percent), Lower(Lead.lead_name)),
+			)
+			.else_(99999)
+		)
+		.orderby(
+			Case()
+			.when(
+				Locate(Lower(txt_no_percent), Lower(Lead.company_name)) > 0,
+				Locate(Lower(txt_no_percent), Lower(Lead.company_name)),
+			)
 			.else_(99999)
 		)
 		.orderby(Lead.idx, order=Order.desc)
@@ -199,6 +214,65 @@ def tax_account_query(doctype: str, txt: str, searchfield: str, start: int, page
 
 @frappe.whitelist()
 @frappe.validate_and_sanitize_search_inputs
+def party_query(
+	doctype: str,
+	txt: str,
+	searchfield: str,
+	start: int,
+	page_len: int,
+	filters: dict | str | None = None,
+):
+	party_name_field = {"Customer": "customer_name", "Supplier": "supplier_name"}.get(doctype)
+	if not party_name_field:
+		frappe.throw(_("Invalid party type: {0}").format(doctype))
+
+	filters = frappe.parse_json(filters) if filters else {}
+	if not isinstance(filters, dict):
+		frappe.throw(_("Party query filters must be a dictionary"))
+
+	company = filters.pop("company", None)
+	fields = get_fields(doctype, ["name", party_name_field])
+	party = DocType(doctype)
+	search_str = f"%{txt}%"
+	txt_no_percent = txt.replace("%", "")
+	search_fields = list(dict.fromkeys([searchfield, *fields]))
+	search_conditions = [party[field].like(search_str) for field in search_fields]
+
+	query = (
+		frappe.qb.get_query(doctype, fields=fields, filters=filters, ignore_permissions=False)
+		.where(party.docstatus < 2)
+		.where(Criterion.any(search_conditions))
+		.orderby(
+			Case()
+			.when(
+				Locate(Lower(txt_no_percent), Lower(party.name)) > 0,
+				Locate(Lower(txt_no_percent), Lower(party.name)),
+			)
+			.else_(99999)
+		)
+		.orderby(
+			Case()
+			.when(
+				Locate(Lower(txt_no_percent), Lower(party[party_name_field])) > 0,
+				Locate(Lower(txt_no_percent), Lower(party[party_name_field])),
+			)
+			.else_(99999)
+		)
+		.orderby(party.idx, order=Order.desc)
+		.orderby(party.name)
+		.orderby(party[party_name_field])
+		.limit(page_len)
+		.offset(start)
+	)
+
+	if company:
+		query = query.where(get_restriction_criterion(doctype, [company]))
+
+	return query.run()
+
+
+@frappe.whitelist()
+@frappe.validate_and_sanitize_search_inputs
 def item_query(
 	doctype: str,
 	txt: str,
@@ -214,6 +288,7 @@ def item_query(
 	doctype = "Item"
 
 	filters = frappe.parse_json(filters)
+	company = filters.pop("company", None) if isinstance(filters, dict) else None
 
 	if filters and isinstance(filters, dict):
 		if filters.get("customer") or filters.get("supplier"):
@@ -361,6 +436,9 @@ def item_query(
 		.offset(start)
 	)
 
+	if company:
+		query = query.where(get_restriction_criterion("Item", [company]))
+
 	return query.run(as_dict=as_dict)
 
 
@@ -382,7 +460,12 @@ def bom(
 		.where(BOM.is_active == 1)
 		.where(BOM[searchfield].like(f"%{txt}%"))
 		.orderby(
-			Case().when(Locate(txt_no_percent, BOM.name) > 0, Locate(txt_no_percent, BOM.name)).else_(99999)
+			Case()
+			.when(
+				Locate(Lower(txt_no_percent), Lower(BOM.name)) > 0,
+				Locate(Lower(txt_no_percent), Lower(BOM.name)),
+			)
+			.else_(99999)
 		)
 		.orderby(BOM.idx, order=Order.desc)
 		.orderby(BOM.name)
@@ -718,7 +801,7 @@ def get_blanket_orders(doctype: str, txt: str, searchfield: str, start: int, pag
 	bo = frappe.qb.DocType("Blanket Order")
 	bo_item = frappe.qb.DocType("Blanket Order Item")
 
-	blanket_orders = (
+	query = (
 		frappe.qb.from_(bo)
 		.from_(bo_item)
 		.select(bo.name)
@@ -731,10 +814,12 @@ def get_blanket_orders(doctype: str, txt: str, searchfield: str, start: int, pag
 			& (bo.company == filters.get("company"))
 			& (bo.docstatus == 1)
 		)
-		.run()
 	)
 
-	return blanket_orders
+	if currency := filters.get("currency"):
+		query = query.where(bo.currency == currency)
+
+	return query.run()
 
 
 @frappe.whitelist()
@@ -1109,19 +1194,14 @@ def get_filtered_child_rows(
 ):
 	table = frappe.qb.DocType(doctype)
 	query = (
-		frappe.qb.from_(table)
+		frappe.get_query(table, filters=filters)
 		.select(
-			table.name,
 			Concat("#", table.idx, ", ", table.item_code),
 		)
 		.orderby(table.idx)
 		.offset(start)
 		.limit(page_len)
 	)
-
-	if filters:
-		for field, value in filters.items():
-			query = query.where(table[field] == value)
 
 	if txt:
 		txt += "%"

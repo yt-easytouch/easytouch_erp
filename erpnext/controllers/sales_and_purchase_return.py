@@ -31,7 +31,9 @@ def validate_return(doc):
 
 def validate_return_against(doc):
 	if not frappe.db.exists(doc.doctype, doc.return_against):
-		frappe.throw(_("Invalid {0}: {1}").format(doc.meta.get_label("return_against"), doc.return_against))
+		frappe.throw(
+			_("Invalid {0}: {1}").format(doc.meta.get_translated_label("return_against"), doc.return_against)
+		)
 	else:
 		ref_doc = frappe.get_doc(doc.doctype, doc.return_against)
 
@@ -40,7 +42,7 @@ def validate_return_against(doc):
 		if ref_doc.get(party_type) != doc.get(party_type):
 			frappe.throw(
 				_("The {0} {1} does not match with the {0} {2} in the {3} {4}").format(
-					doc.meta.get_label(party_type),
+					doc.meta.get_translated_label(party_type),
 					bold(doc.get(party_type)),
 					bold(ref_doc.get(party_type)),
 					ref_doc.doctype,
@@ -160,10 +162,28 @@ def validate_returned_items(doc):
 				):
 					frappe.throw(_("Warehouse is mandatory"))
 
-			items_returned = True
+			if doc.doctype in (
+				"Purchase Invoice",
+				"Purchase Receipt",
+				"Subcontracting Receipt",
+				"Sales Invoice",
+				"Delivery Note",
+				"POS Invoice",
+			):
+				if flt(d.qty) < 0 or flt(d.get("received_qty")) < 0:
+					items_returned = True
+			else:
+				items_returned = True
 
 		elif d.item_name:
-			items_returned = True
+			if doc.doctype in ("Purchase Invoice", "Purchase Receipt", "Subcontracting Receipt"):
+				# No item_code here means no linked Item, so there's no accepted/rejected
+				# split to speak of - received_qty isn't a meaningful independent signal.
+				# Only a negative qty (i.e. a real negative billing amount) counts.
+				if flt(d.qty) < 0:
+					items_returned = True
+			else:
+				items_returned = True
 
 	if not items_returned:
 		frappe.throw(_("At least one item should be entered with negative quantity in return document"))
@@ -174,7 +194,12 @@ def validate_quantity(doc, key, args, ref, valid_items, already_returned_items):
 	if (doc.doctype == "Purchase Invoice" or doc.doctype == "Sales Invoice") and not doc.update_stock:
 		fields = ["qty"]
 
-	if doc.doctype in ["Purchase Receipt", "Purchase Invoice", "Subcontracting Receipt"]:
+	tracks_accepted_rejected_split = doc.doctype in (
+		"Purchase Receipt",
+		"Subcontracting Receipt",
+	) or (doc.doctype == "Purchase Invoice" and doc.update_stock)
+
+	if tracks_accepted_rejected_split:
 		if not args.get("return_qty_from_rejected_warehouse"):
 			fields.extend(["received_qty", "rejected_qty"])
 		else:
@@ -197,7 +222,7 @@ def validate_quantity(doc, key, args, ref, valid_items, already_returned_items):
 			else 0
 		)
 
-		if column == "stock_qty" and not args.get("return_qty_from_rejected_warehouse"):
+		if column in ("stock_qty", "qty") and not args.get("return_qty_from_rejected_warehouse"):
 			reference_qty = ref.get(column)
 			current_stock_qty = args.get(column)
 		elif args.get("return_qty_from_rejected_warehouse"):
@@ -459,11 +484,11 @@ def make_return_doc(doctype: str, source_name: str, target_doc=None, return_agai
 
 			# look for Print Heading "Credit Note"
 			if not doc.select_print_heading:
-				doc.select_print_heading = frappe.get_cached_value("Print Heading", _("Credit Note"))
+				doc.select_print_heading = frappe.get_cached_value("Print Heading", "Credit Note")
 
 		elif doctype == "Purchase Invoice":
 			# look for Print Heading "Debit Note"
-			doc.select_print_heading = frappe.get_cached_value("Print Heading", _("Debit Note"))
+			doc.select_print_heading = frappe.get_cached_value("Print Heading", "Debit Note")
 		elif doctype == "Delivery Note":
 			# manual additions to the return should hit the return warehous, too
 			doc.set_warehouse = default_warehouse_for_sales_return
@@ -795,7 +820,7 @@ def get_rate_for_return(
 	if not (rate and return_against) and voucher_type in ["Sales Invoice", "Delivery Note"]:
 		rate = frappe.db.get_value(f"{voucher_type} Item", voucher_detail_no, "incoming_rate")
 
-		if not rate and sle:
+		if rate is None and sle:
 			rate = get_incoming_rate(
 				{
 					"item_code": sle.item_code,

@@ -21,6 +21,23 @@ add_to_apps_screen = [
 	}
 ]
 
+# Modules that are a folder of code and nothing else. Their doctypes, reports and controllers stay
+# where they are; what they no longer own is navigation, which now sits in the sidebar named beside
+# each. Left in the dock, each would carry an entry of its own for two to four records. See
+# `frappe.utils.modules.get_code_only_modules`.
+#
+# The value names the modules that inherited that navigation, so a Call Log or a Code List resolves
+# to a sidebar the user can actually navigate to instead of dead-ending in a module the dock never
+# shows.
+code_only_modules = {
+	"Telephony": ["ERPNext Integrations"],
+	# Its one doctype, Communication Medium, describes how a call reaches someone, so it sits in
+	# the Telephony section beside the call settings rather than in a shell of its own.
+	"Communication": ["ERPNext Integrations"],
+	"EDI": ["Utilities"],
+	"Bulk Transaction": ["Utilities"],
+}
+
 develop_version = "17.x.x-develop"
 
 app_include_js = "erpnext.bundle.js"
@@ -38,6 +55,7 @@ web_include_icons = [
 
 doctype_js = {
 	"Address": "public/js/address.js",
+	"Sales Order": "public/js/sales_order_proforma.js",
 	"Communication": "public/js/communication.js",
 	"Event": "public/js/event.js",
 	"Newsletter": "public/js/newsletter.js",
@@ -312,12 +330,14 @@ permission_query_conditions = {
 	"Item": "erpnext.stock.doctype.company_restriction.company_restriction.get_permission_query_conditions",
 	"Customer": "erpnext.stock.doctype.company_restriction.company_restriction.get_permission_query_conditions",
 	"Supplier": "erpnext.stock.doctype.company_restriction.company_restriction.get_permission_query_conditions",
+	"Item Price": "erpnext.stock.doctype.company_restriction.company_restriction.get_inherited_permission_query_conditions",
 }
 
 has_permission = {
 	"Item": "erpnext.stock.doctype.company_restriction.company_restriction.has_permission",
 	"Customer": "erpnext.stock.doctype.company_restriction.company_restriction.has_permission",
 	"Supplier": "erpnext.stock.doctype.company_restriction.company_restriction.has_permission",
+	"Item Price": "erpnext.stock.doctype.company_restriction.company_restriction.has_inherited_permission",
 }
 
 has_website_permission = {
@@ -369,6 +389,7 @@ doc_events = {
 		"validate": [
 			"erpnext.support.doctype.service_level_agreement.service_level_agreement.apply",
 			"erpnext.setup.doctype.transaction_deletion_record.transaction_deletion_record.check_for_running_deletion_job",
+			"erpnext.stock.doctype.company_restriction.company_restriction.validate_transaction_company",
 		],
 	},
 	tuple(period_closing_doctypes): {
@@ -376,6 +397,9 @@ doc_events = {
 	},
 	tuple(pre_submit_validation_doctypes): {
 		"validate": "erpnext.accounts.utils.pre_submit_validation",
+	},
+	("Item", "Customer", "Supplier"): {
+		"validate": "erpnext.stock.doctype.company_restriction.company_restriction.validate_allowed_companies",
 	},
 	"Stock Entry": {
 		"on_submit": "erpnext.stock.doctype.material_request.material_request.update_completed_and_requested_qty",
@@ -590,6 +614,7 @@ accounting_dimension_doctypes = [
 	"Purchase Taxes and Charges",
 	"Shipping Rule",
 	"Landed Cost Item",
+	"Landed Cost Taxes and Charges",
 	"Asset Value Adjustment",
 	"Asset Repair",
 	"Asset Capitalization",
@@ -651,16 +676,16 @@ regional_overrides = {
 		"erpnext.controllers.accounts_controller.validate_regional": "erpnext.regional.italy.utils.sales_invoice_validate",
 	},
 }
-user_privacy_documents = [
+user_data_fields = [
 	{
 		"doctype": "Lead",
-		"match_field": "email_id",
-		"personal_fields": ["phone", "mobile_no", "fax", "website", "lead_name"],
+		"filter_by": "email_id",
+		"redact_fields": ["phone", "mobile_no", "fax", "website", "lead_name"],
 	},
 	{
 		"doctype": "Opportunity",
-		"match_field": "contact_email",
-		"personal_fields": ["contact_mobile", "contact_display", "customer_name"],
+		"filter_by": "contact_email",
+		"redact_fields": ["contact_mobile", "contact_display", "customer_name"],
 	},
 ]
 
