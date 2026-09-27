@@ -1,14 +1,14 @@
 // Copyright (c) 2015, Frappe Technologies Pvt. Ltd. and Contributors
 // License: GNU General Public License v3. See license.txt
 
-cur_frm.cscript.tax_table = "Sales Taxes and Charges";
-
 erpnext.accounts.taxes.setup_tax_filters("Sales Taxes and Charges");
 erpnext.accounts.taxes.setup_tax_validations("Sales Order");
 erpnext.sales_common.setup_selling_controller();
 
 frappe.ui.form.on("Sales Order", {
 	setup: function (frm) {
+		frm.cscript.tax_table = "Sales Taxes and Charges";
+
 		frm.custom_make_buttons = {
 			"Delivery Note": "Delivery Note",
 			"Pick List": "Pick List",
@@ -1257,6 +1257,7 @@ erpnext.selling.SalesOrderController = class SalesOrderController extends erpnex
 						get_query_filters: {
 							company: me.frm.doc.company,
 							docstatus: 1,
+							is_active: 1,
 							status: ["not in", ["Lost", "Ordered"]],
 						},
 						allow_child_item_selection: true,
@@ -1922,7 +1923,7 @@ erpnext.selling.SalesOrderController = class SalesOrderController extends erpnex
 	}
 };
 
-extend_cscript(cur_frm.cscript, new erpnext.selling.SalesOrderController({ frm: cur_frm }));
+frappe.ui.form.set_controller("Sales Order", erpnext.selling.SalesOrderController);
 
 function prevent_past_delivery_dates(frm) {
 	if (frm.doc.transaction_date) {

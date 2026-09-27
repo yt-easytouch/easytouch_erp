@@ -15,7 +15,7 @@ from frappe.website.website_generator import WebsiteGenerator
 
 import erpnext
 from erpnext.setup.utils import get_exchange_rate
-from erpnext.stock.doctype.item.item import get_item_details
+from erpnext.stock.doctype.item.item import _get_item_details
 from erpnext.stock.get_item_details import get_conversion_factor, get_price_list_rate
 
 form_grid_templates = {"items": "templates/form_grid/item_grid.html"}
@@ -184,7 +184,6 @@ class BOM(WebsiteGenerator):
 		secondary_items: DF.Table[BOMSecondaryItem]
 		secondary_items_cost: DF.Currency
 		set_qty_based_on_percentage: DF.Check
-		set_rate_of_sub_assembly_item_based_on_bom: DF.Check
 		show_in_website: DF.Check
 		show_items: DF.Check
 		show_operations: DF.Check
@@ -538,8 +537,7 @@ class BOM(WebsiteGenerator):
 				own_cost += flt(item.cost)
 			total_secondary_items_per += flt(item.cost_allocation_per)
 
-		if self.cost_allocation_per == 100 and total_secondary_items_per:
-			self.cost_allocation_per -= total_secondary_items_per
+		self.cost_allocation_per = flt(100 - total_secondary_items_per)
 
 		self.cost_allocation = (self.raw_material_cost - own_cost) * (self.cost_allocation_per / 100)
 
@@ -564,7 +562,7 @@ class BOM(WebsiteGenerator):
 		self.manage_default_bom()
 
 	def get_item_det(self, item_code):
-		item = get_item_details(item_code)
+		item = _get_item_details(item_code)
 
 		if not item:
 			frappe.throw(_("Item: {0} does not exist in the system").format(item_code))
@@ -624,6 +622,7 @@ class BOM(WebsiteGenerator):
 					"conversion_factor": item.conversion_factor,
 					"sourced_by_supplier": item.sourced_by_supplier,
 					"do_not_explode": item.do_not_explode,
+					"set_rate_of_sub_assembly_item_based_on_bom": item.set_rate_of_sub_assembly_item_based_on_bom,
 					"source_warehouse": item.source_warehouse or self.default_source_warehouse,
 					"fetch_rate": True,
 				}
@@ -972,7 +971,7 @@ class BOM(WebsiteGenerator):
 	def _add_raw_material_row(self, operation_row_id, row):
 		row = parse_json(row)
 
-		row.update(get_item_details(row.get("item_code")))
+		row.update(_get_item_details(row.get("item_code")))
 		row.operation_row_id = operation_row_id
 
 		item_row = self.get_item_data(row.item_code, operation_row_id)
@@ -1491,6 +1490,7 @@ def _build_base_bom_items_query(bom, company, qty, t):
 			Min(t.bom_item.idx).as_("idx"),
 			Max(t.item_doc.item_name).as_("item_name"),
 			(Sum(t.qty_field_col / IfNull(t.bom_doc.quantity, 1)) * qty).as_("qty"),
+			(Sum(t.bom_item.stock_qty / IfNull(t.bom_doc.quantity, 1)) * qty).as_("stock_qty"),
 			Max(t.item_doc.image).as_("image"),
 			Max(t.bom_doc.project).as_("project"),
 			Max(t.item_doc.stock_uom).as_("stock_uom"),
@@ -1608,19 +1608,20 @@ def _add_bom_item_to_dict(item_dict, item, company, opts):
 	if item.operation:
 		key = (item.item_code, item.operation)
 
+	stock_qty = item.pop("stock_qty")
 	if item.get("is_phantom_item"):
-		_merge_phantom_bom_items(item_dict, item, company, opts)
+		_merge_phantom_bom_items(item_dict, item, stock_qty, company, opts)
 	elif key in item_dict:
 		item_dict[key]["qty"] += flt(item.qty)
 	else:
 		item_dict[key] = item
 
 
-def _merge_phantom_bom_items(item_dict, item, company, opts):
+def _merge_phantom_bom_items(item_dict, item, stock_qty, company, opts):
 	data = get_bom_items_as_dict(
 		item.get("bom_no"),
 		company,
-		qty=item.get("qty"),
+		qty=stock_qty,
 		fetch_exploded=opts.fetch_exploded,
 		fetch_secondary_items=opts.fetch_secondary_items,
 		include_non_stock_items=opts.include_non_stock_items,

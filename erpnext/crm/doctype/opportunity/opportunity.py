@@ -166,7 +166,7 @@ class Opportunity(TransactionBase, CRMNote):
 
 	def set_opportunity_type(self):
 		if self.is_new() and not self.opportunity_type:
-			self.opportunity_type = _("Sales")
+			self.opportunity_type = "Sales"
 
 	def set_exchange_rate(self):
 		company_currency = frappe.get_cached_value("Company", self.company, "default_currency")
@@ -302,6 +302,7 @@ class Opportunity(TransactionBase, CRMNote):
 					"opportunity": self.name,
 					"status": ("not in", ["Lost", "Cancelled", "Expired"]),
 					"docstatus": 1,
+					"is_active": 1,
 				},
 				"name",
 			)
@@ -315,6 +316,7 @@ class Opportunity(TransactionBase, CRMNote):
 				.select(q.name)
 				.where(
 					(q.docstatus == 1)
+					& (q.is_active == 1)
 					& (qi.prevdoc_docname == self.name)
 					& q.status.notin(["Lost", "Cancelled", "Expired"])
 				)

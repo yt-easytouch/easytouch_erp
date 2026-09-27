@@ -2415,8 +2415,8 @@ class QueryPaymentLedger:
 			.groupby(ple.account, ple.voucher_type, ple.voucher_no, ple.party_type, ple.party)
 		).as_("grouped")
 
-		# Payment Ledger Entry has no autoname rule, so frappe names it by hash -- lower-case, which
-		# keeps Min(name) free of the collation divergence that picking Max() over free text has.
+		# KNOWN DIVERGENCE: Min(name) is a text sort. Hash names are not reliably lower case -- the
+		# trace-id prefix is not lowered -- so the engines can pick different rows here.
 		representative_ple = qb.DocType("Payment Ledger Entry").as_("representative_ple")
 		query_voucher_amount = (
 			qb.from_(grouped_voucher_amount)
@@ -2781,48 +2781,21 @@ def is_immutable_ledger_enabled():
 	return frappe.get_single_value("Accounts Settings", "enable_immutable_ledger")
 
 
-PRE_SUBMIT_DOCTYPE_CONFIG = {
-	"Sales Invoice": {
-		"check_prev_docstatus": True,
-		"check_credit_limit": True,
-	},
-	"Purchase Invoice": {
-		"check_prev_docstatus": True,
-	},
-	"Delivery Note": {
-		"check_prev_docstatus": True,
-		"check_credit_limit": True,
-		"check_packed_qty": True,
-	},
-	"Purchase Receipt": {
-		"check_prev_docstatus": True,
-	},
-	"Sales Order": {
-		"check_credit_limit": True,
-	},
-}
-
-
-def pre_submit_validation(doc, method=None):
-	cfg = PRE_SUBMIT_DOCTYPE_CONFIG.get(doc.doctype)
+def pre_submit_validation(doc, check_prev_docstatus=False, check_credit_limit=False, check_packed_qty=False):
 	if (
 		doc.docstatus != 0
 		or not frappe.get_cached_value("Accounts Settings", None, "preview_mode")
-		or not cfg
 		or not doc.company
 	):
 		return
-	_run_pre_submit_checks(doc, cfg)
 
-
-def _run_pre_submit_checks(doc, cfg):
-	if cfg.get("check_prev_docstatus"):
+	if check_prev_docstatus:
 		_check_prev_docstatus(doc)
 
-	if cfg.get("check_credit_limit"):
+	if check_credit_limit:
 		_check_credit_limit_warn(doc)
 
-	if cfg.get("check_packed_qty"):
+	if check_packed_qty:
 		_check_packed_qty_warn(doc)
 
 

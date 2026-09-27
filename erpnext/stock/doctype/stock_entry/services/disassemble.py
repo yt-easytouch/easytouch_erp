@@ -24,6 +24,10 @@ def _qty_tolerance(precision: int) -> float:
 	return 1.0 / (10**precision)
 
 
+def _manufacture_line_order(line):
+	return (line.parent_creation, line.parent_name.casefold(), line.parent_name, line.idx)
+
+
 class DisassembleStockEntry(BaseStockEntry):
 	def validate(self):
 		self.validate_warehouse()
@@ -382,6 +386,10 @@ class DisassembleStockEntry(BaseStockEntry):
 		is_finished_item decides whether the row is the output or an input. Aggregating each column
 		on its own can pair values from different lines into a row that was never posted, so take
 		the columns from a single real line instead. UOM is normalized separately to stock UOM.
+
+		Ordered in Python rather than SQL, keeping the original (entry creation, entry name, line idx)
+		precedence. casefold reproduces MariaDB's case-insensitive collation without depending on the
+		database's, which PostgreSQL resolves by byte value.
 		"""
 		SE = frappe.qb.DocType("Stock Entry")
 		SED = frappe.qb.DocType("Stock Entry Detail")
@@ -391,6 +399,9 @@ class DisassembleStockEntry(BaseStockEntry):
 			.join(SE)
 			.on(SED.parent == SE.name)
 			.select(
+				SE.creation.as_("parent_creation"),
+				SE.name.as_("parent_name"),
+				SED.idx,
 				SED.item_code,
 				SED.item_name,
 				SED.description,
@@ -409,20 +420,22 @@ class DisassembleStockEntry(BaseStockEntry):
 			.where(
 				(SE.docstatus == 1) & (SE.purpose == "Manufacture") & (SE.work_order == self.doc.work_order)
 			)
-			.orderby(SE.creation)
-			.orderby(SE.name)
-			.orderby(SED.idx)
 			.run(as_dict=True)
 		)
+		lines.sort(key=_manufacture_line_order)
 
 		representative = {}
 		for line in lines:
+			line.pop("parent_creation")
+			line.pop("parent_name")
 			representative.setdefault(line.item_code, line)
 
 		return representative
 
-	def on_submit(self):
+	def before_submit(self):
 		self.set_serial_batch_for_disassembly()
+
+	def on_submit(self):
 		self.update_disassembled_order()
 
 	def on_cancel(self):

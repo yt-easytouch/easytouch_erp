@@ -92,11 +92,13 @@ class Customer(TransactionBase):
 		market_segment: DF.Link | None
 		mobile_no: DF.ReadOnly | None
 		naming_series: DF.Literal["CUST-.YYYY.-"]
+		on_hold: DF.Check
 		opportunity_name: DF.Link | None
 		payment_terms: DF.Link | None
 		portal_users: DF.Table[PortalUser]
 		primary_address: DF.TextEditor | None
 		prospect_name: DF.Link | None
+		release_date: DF.Date | None
 		represents_company: DF.Link | None
 		restrict_to_companies: DF.Check
 		sales_team: DF.Table[SalesTeam]
@@ -118,6 +120,10 @@ class Customer(TransactionBase):
 	def load_dashboard_info(self):
 		info = get_dashboard_info(self.doctype, self.name, self.loyalty_program)
 		self.set_onload("dashboard_info", info)
+
+	def before_save(self):
+		if not self.on_hold:
+			self.release_date = None
 
 	def autoname(self):
 		cust_master_name = frappe.defaults.get_global_default("cust_master_name")
@@ -516,6 +522,13 @@ def get_nested_links(link_doctype, link_name, ignore_permissions=False):
 	return links
 
 
+def is_customer_blocked(customer: str) -> bool:
+	on_hold, release_date = frappe.db.get_value("Customer", customer, ["on_hold", "release_date"])
+	if not on_hold:
+		return False
+	return not release_date or getdate(today()) <= getdate(release_date)
+
+
 def check_credit_limit(customer, company, ignore_outstanding_sales_order=False, extra_amount=0):
 	credit_limit = get_credit_limit(customer, company)
 	if not credit_limit:
@@ -843,6 +856,16 @@ def get_credit_limit(customer, company):
 def get_customer_primary(doctype: str, txt: str, searchfield: str, start: int, page_len: int, filters: dict):
 	customer = filters.get("customer")
 	type = filters.get("type")
+
+	# `type` is caller-supplied and was interpolated straight into qb.DocType(), so any doctype on
+	# the site could be joined to Dynamic Link and read. The two pickers that call this
+	# (customer.js:84,94) send only these two values.
+	if type not in ("Contact", "Address"):
+		frappe.throw(_("Invalid type"), frappe.PermissionError)
+
+	# authorise the party, not Contact/Address: the `if_owner` row on Address would empty the picker rather than error
+	frappe.has_permission("Customer", doc=customer, throw=True)
+
 	type_doctype = qb.DocType(type)
 	dlink = qb.DocType("Dynamic Link")
 

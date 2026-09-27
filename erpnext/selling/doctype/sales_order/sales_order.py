@@ -19,6 +19,7 @@ from erpnext.accounts.doctype.sales_invoice.sales_invoice import (
 	update_linked_doc,
 	validate_inter_company_party,
 )
+from erpnext.accounts.utils import pre_submit_validation
 from erpnext.controllers.selling_controller import SellingController
 from erpnext.manufacturing.doctype.blanket_order.blanket_order import (
 	validate_against_blanket_order,
@@ -252,7 +253,6 @@ class SalesOrder(SellingController):
 		self.validate_warehouse()
 		self.validate_drop_ship()
 		SalesOrderStockReservation(self).validate_reserved_stock()
-		self.validate_serial_no_based_delivery()
 		validate_against_blanket_order(self)
 		validate_inter_company_party(
 			self.doctype, self.customer, self.company, self.inter_company_order_reference
@@ -275,6 +275,7 @@ class SalesOrder(SellingController):
 		StatusService(self).set_default_statuses()
 
 		self.reset_default_field_value("set_warehouse", "items", "warehouse")
+		pre_submit_validation(self, check_credit_limit=True)
 
 	def set_has_unit_price_items(self):
 		"""
@@ -503,6 +504,12 @@ class SalesOrder(SellingController):
 				if doc.docstatus.is_cancelled():
 					frappe.throw(_("Quotation {0} is cancelled").format(quotation))
 
+				if flag == "submit" and doc.status == "Lost":
+					frappe.throw(_("Quotation {0} is Lost").format(quotation))
+
+				if flag == "submit" and not doc.is_active:
+					frappe.throw(_("Quotation {0} is inactive").format(quotation))
+
 				doc.set_status(update=True)
 				doc.update_opportunity("Converted" if flag == "submit" else "Quotation")
 
@@ -694,41 +701,6 @@ class SalesOrder(SellingController):
 				),
 			)
 
-	def validate_serial_no_based_delivery(self):
-		reserved_items = []
-		normal_items = []
-		for item in self.items:
-			if item.ensure_delivery_based_on_produced_serial_no:
-				if item.item_code in normal_items:
-					frappe.throw(
-						_(
-							"Cannot ensure delivery by Serial No as Item {0} is added with and without Ensure Delivery by Serial No."
-						).format(item.item_code)
-					)
-				if item.item_code not in reserved_items:
-					if not frappe.get_cached_value("Item", item.item_code, "has_serial_no"):
-						frappe.throw(
-							_(
-								"Item {0} has no Serial No. Only serialized items can have delivery based on Serial No"
-							).format(item.item_code)
-						)
-					if not frappe.db.exists("BOM", {"item": item.item_code, "is_active": 1}):
-						frappe.throw(
-							_(
-								"No active BOM found for item {0}. Delivery by Serial No cannot be ensured"
-							).format(item.item_code)
-						)
-				reserved_items.append(item.item_code)
-			else:
-				normal_items.append(item.item_code)
-
-			if not item.ensure_delivery_based_on_produced_serial_no and item.item_code in reserved_items:
-				frappe.throw(
-					_(
-						"Cannot ensure delivery by Serial No as Item {0} is added with and without Ensure Delivery by Serial No."
-					).format(item.item_code)
-				)
-
 	@frappe.whitelist()
 	def has_unreserved_stock(self, table_name: str = "items") -> dict:
 		"""Returns unreserved qty per item if there is any unreserved item in the Sales Order."""
@@ -790,14 +762,19 @@ def is_enable_cutoff_date_on_bulk_delivery_note_creation():
 	return frappe.get_single_value("Selling Settings", "enable_cutoff_date_on_bulk_delivery_note_creation")
 
 
-@frappe.whitelist()
+@frappe.whitelist(methods=["POST"])
 def close_or_unclose_sales_orders(names: str | list, status: str):
-	if not frappe.has_permission("Sales Order", "write"):
-		frappe.throw(_("Not permitted"), frappe.PermissionError)
+	frappe.has_permission("Sales Order", "write", throw=True)
 
 	names = frappe.parse_json(names)
 	for name in names:
-		so = frappe.get_lazy_doc("Sales Order", name)
+		if not isinstance(name, str):
+			frappe.throw(_("Invalid name"), frappe.PermissionError)
+
+		# the check above is doctype level and never consults User Permissions, so on its own it
+		# lets a caller restricted to one company close another company's orders. Checking each
+		# document is what scopes it, and matches what update_status() below already does.
+		so = frappe.get_lazy_doc("Sales Order", name, check_permission="submit")
 		if so.docstatus == 1:
 			if status == "Closed":
 				if so.status not in ("Cancelled", "Closed") and (
@@ -857,7 +834,7 @@ def get_events(start: str, end: str, filters: str | dict | None = None):
 	return data
 
 
-@frappe.whitelist()
+@frappe.whitelist(methods=["POST"])
 def update_status(status: str, name: str):
 	so = frappe.get_doc("Sales Order", name, check_permission="submit")
 	so.update_status(status)

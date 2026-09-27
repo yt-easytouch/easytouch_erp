@@ -56,6 +56,19 @@ def get_sle(**args):
 	)
 
 
+def stock_entry_row(item_code, qty, **kwargs):
+	stock_uom = frappe.db.get_value("Item", item_code, "stock_uom")
+	return {
+		"item_code": item_code,
+		"qty": qty,
+		"transfer_qty": qty,
+		"uom": stock_uom,
+		"stock_uom": stock_uom,
+		"conversion_factor": 1,
+		**kwargs,
+	}
+
+
 class TestStockEntry(ERPNextTestSuite):
 	def setUp(self):
 		self.load_test_records("Stock Entry")
@@ -259,7 +272,8 @@ class TestStockEntry(ERPNextTestSuite):
 		company = "_Test Company"
 
 		create_warehouse("Test From Warehouse")
-		create_warehouse("Test Transit Warehouse")
+		create_warehouse("Test Transit Warehouse", properties={"warehouse_type": "Transit"})
+		frappe.db.set_value("Warehouse", "Test Transit Warehouse - _TC", "warehouse_type", "Transit")
 		create_warehouse("Test To Warehouse")
 
 		create_item(
@@ -309,6 +323,131 @@ class TestStockEntry(ERPNextTestSuite):
 
 		transit_entry.reload()
 		self.assertEqual(transit_entry.per_transferred, 100)
+
+	def test_end_transit_qty_with_uom_conversion(self):
+		"""transferred_qty is tracked in the stock UOM, so the end transit qty must be converted back."""
+		company = "_Test Company"
+		source_warehouse = "_Test Warehouse - _TC"
+		target_warehouse = "_Test Warehouse 1 - _TC"
+		transit_warehouse = get_in_transit_warehouse(company)
+
+		item_code = make_item(
+			"_Test Transit UOM Conversion Item",
+			{"is_stock_item": 1, "stock_uom": "Nos", "uoms": [{"uom": "Kg", "conversion_factor": 0.5}]},
+		).name
+
+		make_stock_entry(item_code=item_code, target=source_warehouse, qty=100, basic_rate=100)
+
+		transit_entry = make_stock_entry(
+			item_code=item_code,
+			source=source_warehouse,
+			target=transit_warehouse,
+			purpose="Material Transfer",
+			add_to_transit=1,
+			qty=10,
+			basic_rate=100,
+			do_not_save=True,
+		)
+		transit_entry.items[0].uom = "Kg"
+		transit_entry.items[0].conversion_factor = 0.5
+		transit_entry.save().submit()
+		self.assertEqual(transit_entry.items[0].transfer_qty, 5)
+
+		partial_entry = make_stock_in_entry(transit_entry.name)
+		partial_entry.to_warehouse = target_warehouse
+		partial_entry.items[0].qty = 4
+		partial_entry.items[0].t_warehouse = target_warehouse
+		partial_entry.save().submit()
+
+		remaining_entry = make_stock_in_entry(transit_entry.name)
+		self.assertEqual(remaining_entry.items[0].uom, "Kg")
+		self.assertEqual(remaining_entry.items[0].qty, 6)
+
+		remaining_entry.to_warehouse = target_warehouse
+		remaining_entry.items[0].t_warehouse = target_warehouse
+		remaining_entry.save().submit()
+
+		self.assertFalse(make_stock_in_entry(transit_entry.name).get("items"))
+
+	def test_end_transit_maps_smallest_remaining_qty(self):
+		"""The smallest storable remainder survives binary subtraction, 2.001 - 2 is 0.0009999999999998899."""
+		company = "_Test Company"
+		source_warehouse = "_Test Warehouse - _TC"
+		target_warehouse = "_Test Warehouse 1 - _TC"
+		transit_warehouse = get_in_transit_warehouse(company)
+
+		item_code = make_item(
+			"_Test Transit Fractional Item", {"is_stock_item": 1, "stock_uom": "Litre"}
+		).name
+		smallest_qty = 1 / (10 ** frappe.get_precision("Stock Entry Detail", "transfer_qty"))
+
+		make_stock_entry(item_code=item_code, target=source_warehouse, qty=100, basic_rate=100)
+
+		transit_entry = make_stock_entry(
+			item_code=item_code,
+			source=source_warehouse,
+			target=transit_warehouse,
+			purpose="Material Transfer",
+			add_to_transit=1,
+			qty=2 + smallest_qty,
+			basic_rate=100,
+		)
+
+		partial_entry = make_stock_in_entry(transit_entry.name)
+		partial_entry.to_warehouse = target_warehouse
+		partial_entry.items[0].qty = 2
+		partial_entry.items[0].t_warehouse = target_warehouse
+		partial_entry.save().submit()
+
+		remaining_entry = make_stock_in_entry(transit_entry.name)
+		self.assertEqual(remaining_entry.items[0].qty, smallest_qty)
+
+	def test_add_to_transit_non_transit_target_warehouse_validation(self):
+		from erpnext.stock.doctype.warehouse.test_warehouse import create_warehouse
+
+		item_code = "_Test Transit Item 2"
+		company = "_Test Company"
+
+		create_warehouse("Test Source Warehouse")
+		create_warehouse("Test Regular Target Warehouse")
+
+		create_item(
+			item_code=item_code,
+			is_stock_item=1,
+			is_purchase_item=1,
+			company=company,
+		)
+
+		make_stock_entry(
+			item_code=item_code,
+			target="Test Source Warehouse - _TC",
+			qty=10,
+			basic_rate=100,
+			expense_account="Stock Adjustment - _TC",
+			cost_center="Main - _TC",
+		)
+
+		# Submitting or saving with add_to_transit=1 and a non-transit target warehouse must be rejected
+		se = frappe.new_doc("Stock Entry")
+		se.purpose = "Material Transfer"
+		se.stock_entry_type = "Material Transfer"
+		se.company = company
+		se.from_warehouse = "Test Source Warehouse - _TC"
+		se.to_warehouse = "Test Regular Target Warehouse - _TC"
+		se.add_to_transit = 1
+		se.append(
+			"items",
+			{
+				"item_code": item_code,
+				"s_warehouse": "Test Source Warehouse - _TC",
+				"t_warehouse": "Test Regular Target Warehouse - _TC",
+				"qty": 5,
+				"basic_rate": 100,
+				"expense_account": "Stock Adjustment - _TC",
+				"cost_center": "Main - _TC",
+			},
+		)
+		self.assertRaises(frappe.ValidationError, se.save)
 
 	def test_material_receipt_gl_entry(self):
 		company = frappe.db.get_value("Warehouse", "Stores - TCP1", "company")
@@ -1609,32 +1748,25 @@ class TestStockEntry(ERPNextTestSuite):
 
 		make_stock_entry(item_code=rm_item, target="_Test Warehouse - _TC", qty=10, basic_rate=100)
 
-		def row(item_code, qty, **kwargs):
-			stock_uom = frappe.db.get_value("Item", item_code, "stock_uom")
-			return {
-				"item_code": item_code,
-				"qty": qty,
-				"transfer_qty": qty,
-				"uom": stock_uom,
-				"stock_uom": stock_uom,
-				"conversion_factor": 1,
-				**kwargs,
-			}
-
 		entry = frappe.new_doc("Stock Entry")
 		entry.company = "_Test Company"
 		entry.purpose = "Manufacture"
 		entry.set_stock_entry_type()
 		entry.fg_completed_qty = 1
-		entry.append("items", row(rm_item, 10, s_warehouse="_Test Warehouse - _TC"))
-		entry.append("items", row(fg_item, 1, t_warehouse="_Test Warehouse 1 - _TC", is_finished_item=1))
+		entry.append("items", stock_entry_row(rm_item, 10, s_warehouse="_Test Warehouse - _TC"))
 		entry.append(
 			"items",
-			row(scrap_item, 2, t_warehouse="_Test Warehouse 1 - _TC", secondary_item_type="Scrap"),
+			stock_entry_row(fg_item, 1, t_warehouse="_Test Warehouse 1 - _TC", is_finished_item=1),
 		)
 		entry.append(
 			"items",
-			row(
+			stock_entry_row(
+				scrap_item, 2, t_warehouse="_Test Warehouse 1 - _TC", secondary_item_type="Scrap"
+			),
+		)
+		entry.append(
+			"items",
+			stock_entry_row(
 				manual_item,
 				1,
 				t_warehouse="_Test Warehouse 1 - _TC",
@@ -1662,6 +1794,88 @@ class TestStockEntry(ERPNextTestSuite):
 		# there is no percentage to allocate without a BOM row
 		manual_row.valuation_type = "% of Component Cost"
 		self.assertRaises(frappe.ValidationError, entry.save)
+
+	@ERPNextTestSuite.change_settings("Stock Reposting Settings", {"item_based_reposting": 0})
+	def test_repost_values_costed_out_row_as_of_posting_date(self):
+		from erpnext.stock.doctype.repost_item_valuation.repost_item_valuation import repost_sl_entries
+
+		fg_item = make_item(properties={"is_stock_item": 1}).name
+		rm_item = make_item(properties={"is_stock_item": 1, "valuation_method": "Moving Average"}).name
+		scrap_item = make_item(properties={"is_stock_item": 1}).name
+
+		make_stock_entry(
+			item_code=rm_item,
+			target="_Test Warehouse - _TC",
+			qty=10,
+			basic_rate=100,
+			posting_date=add_days(today(), -10),
+		)
+		make_stock_entry(
+			item_code=scrap_item,
+			target="_Test Warehouse 1 - _TC",
+			qty=5,
+			basic_rate=50,
+			posting_date=add_days(today(), -10),
+		)
+
+		entry = frappe.new_doc("Stock Entry")
+		entry.company = "_Test Company"
+		entry.purpose = "Manufacture"
+		entry.set_stock_entry_type()
+		entry.set_posting_time = 1
+		entry.posting_date = add_days(today(), -5)
+		entry.posting_time = "10:00:00"
+		entry.fg_completed_qty = 1
+		entry.append("items", stock_entry_row(rm_item, 10, s_warehouse="_Test Warehouse - _TC"))
+		entry.append(
+			"items",
+			stock_entry_row(fg_item, 1, t_warehouse="_Test Warehouse 1 - _TC", is_finished_item=1),
+		)
+		entry.append(
+			"items",
+			stock_entry_row(
+				scrap_item, 2, t_warehouse="_Test Warehouse 1 - _TC", secondary_item_type="Scrap"
+			),
+		)
+		entry.insert()
+		entry.submit()
+
+		self.assertEqual(entry.items[2].basic_rate, 50)
+		self.assertEqual(entry.items[1].basic_rate, 900)
+
+		make_stock_entry(
+			item_code=scrap_item,
+			target="_Test Warehouse 1 - _TC",
+			qty=10,
+			basic_rate=5000,
+			posting_date=add_days(today(), -1),
+		)
+
+		make_stock_entry(
+			item_code=scrap_item,
+			target="_Test Warehouse 1 - _TC",
+			qty=10,
+			basic_rate=9000,
+			posting_date=add_days(today(), -5),
+			posting_time="10:00:00",
+		)
+
+		backdated_receipt = make_stock_entry(
+			item_code=rm_item,
+			target="_Test Warehouse - _TC",
+			qty=10,
+			basic_rate=200,
+			posting_date=add_days(today(), -8),
+		)
+		repost = frappe.db.get_value(
+			"Repost Item Valuation", {"voucher_no": backdated_receipt.name, "docstatus": 1}, "name"
+		)
+		repost_sl_entries(frappe.get_doc("Repost Item Valuation", repost))
+
+		entry.load_from_db()
+
+		self.assertEqual(entry.items[2].basic_rate, 50)
+		self.assertEqual(entry.items[1].basic_rate, 1400)
 
 	def test_valuation_rate_lookup_without_voucher_no(self):
 		from erpnext.stock.stock_ledger import get_valuation_rate
@@ -4807,6 +5021,121 @@ def initialize_records_for_future_negative_sle_test(
 		batch_no=batch_no,
 	)
 	return warehouse_names
+
+
+class TestJobCardSecondaryItems(ERPNextTestSuite):
+	"""get_secondary_items_from_job_card aggregates a work order's job cards into one row per item."""
+
+	def setUp(self):
+		from erpnext.manufacturing.doctype.job_card.test_job_card import (
+			create_bom_with_multiple_operations,
+		)
+		from erpnext.manufacturing.doctype.operation.test_operation import make_operation
+
+		self.load_test_records("BOM")
+		make_operation({"operation": "_Test Operation 1", "workstation": "_Test Workstation A"})
+		create_bom_with_multiple_operations()
+
+	def make_submitted_job_card(self, job_card_name, item_code, stock_qty, bom_secondary_item):
+		job_card = frappe.get_doc("Job Card", job_card_name)
+		job_card.append(
+			"secondary_items",
+			{
+				"item_code": item_code,
+				"stock_qty": stock_qty,
+				"secondary_item_type": "Scrap",
+				"bom_secondary_item": bom_secondary_item,
+			},
+		)
+		job_card.append(
+			"time_logs",
+			{
+				"from_time": "2009-01-01 12:06:25",
+				"to_time": "2009-01-01 12:37:25",
+				"time_in_mins": "31.00002",
+				"completed_qty": job_card.for_quantity,
+			},
+		)
+		job_card.submit()
+
+	def make_work_order_with_two_job_cards(self):
+		from erpnext.manufacturing.doctype.work_order.test_work_order import make_wo_order_test_record
+
+		work_order = make_wo_order_test_record(
+			item="_Test FG Item 2",
+			qty=2,
+			transfer_material_against="Work Order",
+			source_warehouse="Stores - _TC",
+		)
+		job_cards = frappe.get_all(
+			"Job Card", filters={"work_order": work_order.name}, order_by="creation", pluck="name"
+		)
+		self.assertGreaterEqual(len(job_cards), 2, "fixture must produce at least two job cards")
+		return work_order, job_cards
+
+	def test_secondary_item_columns_come_from_one_line(self):
+		"""stock_uom is a stored snapshot, so it can differ between a work order's job cards.
+
+		It was aggregated with Max(), a sort over text that MariaDB and PostgreSQL resolve
+		differently, and one that can also report a unit belonging to neither the name nor the
+		description beside it. Take it off the same representative line as those.
+		"""
+		from erpnext.stock.doctype.item.test_item import make_item
+		from erpnext.stock.doctype.stock_entry.services.manufacturing import (
+			get_secondary_items_from_job_card,
+		)
+
+		# the first card snapshots "Box"; Max() over the pair returns "Nos", so the two disagree
+		scrap_item = make_item("_Test JC Secondary Snapshot", {"is_stock_item": 1, "stock_uom": "Box"})
+		work_order, job_cards = self.make_work_order_with_two_job_cards()
+
+		self.make_submitted_job_card(job_cards[0], scrap_item.name, 5, "BOM-ROW-A")
+
+		scrap_item.reload()
+		scrap_item.stock_uom = "Nos"
+		scrap_item.item_name = "_Test JC Secondary Snapshot Renamed"
+		scrap_item.save()
+
+		self.make_submitted_job_card(job_cards[1], scrap_item.name, 3, "BOM-ROW-A")
+
+		rows = [
+			row
+			for row in get_secondary_items_from_job_card(work_order.name)
+			if row.item_code == scrap_item.name
+		]
+
+		self.assertEqual(len(rows), 1, "the reported row count must not change")
+		self.assertEqual(rows[0].stock_uom, "Box")
+		self.assertEqual(rows[0].item_name, "_Test JC Secondary Snapshot")
+		self.assertEqual(flt(rows[0].stock_qty), 8)
+
+	def test_secondary_item_metadata_is_scoped_to_its_bom_row(self):
+		"""Two BOM rows for the same item and type are separate groups, each with its own line."""
+		from erpnext.stock.doctype.item.test_item import make_item
+		from erpnext.stock.doctype.stock_entry.services.manufacturing import (
+			get_secondary_items_from_job_card,
+		)
+
+		scrap_item = make_item("_Test JC Secondary Bom Row", {"is_stock_item": 1, "stock_uom": "Nos"})
+		work_order, job_cards = self.make_work_order_with_two_job_cards()
+
+		self.make_submitted_job_card(job_cards[0], scrap_item.name, 5, "BOM-ROW-A")
+
+		scrap_item.reload()
+		scrap_item.item_name = "_Test JC Secondary Bom Row Renamed"
+		scrap_item.save()
+
+		self.make_submitted_job_card(job_cards[1], scrap_item.name, 3, "BOM-ROW-B")
+
+		by_bom_row = {
+			row.bom_secondary_item: row
+			for row in get_secondary_items_from_job_card(work_order.name)
+			if row.item_code == scrap_item.name
+		}
+
+		self.assertEqual(set(by_bom_row), {"BOM-ROW-A", "BOM-ROW-B"})
+		self.assertEqual(by_bom_row["BOM-ROW-A"].item_name, "_Test JC Secondary Bom Row")
+		self.assertEqual(by_bom_row["BOM-ROW-B"].item_name, "_Test JC Secondary Bom Row Renamed")
 
 
 def create_stock_entries(sequence_of_entries):

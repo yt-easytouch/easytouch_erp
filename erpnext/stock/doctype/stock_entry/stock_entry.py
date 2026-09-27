@@ -34,7 +34,7 @@ from erpnext.stock.get_item_details import (
 	get_default_cost_center,
 )
 from erpnext.stock.stock_ledger import get_previous_sle, get_valuation_rate
-from erpnext.stock.utils import get_incoming_rate
+from erpnext.stock.utils import _get_incoming_rate, check_warehouse_company, get_combine_datetime
 
 from .services.disassemble import DisassembleStockEntry
 from .services.manufacturing import (
@@ -366,10 +366,10 @@ class StockEntry(StockController, SubcontractingInwardController):
 			self.purpose_cls(self).before_submit()
 
 	def on_submit(self):
+		self.make_bundle_using_old_serial_batch_fields()
 		if self.purpose_cls and hasattr(self.purpose_cls, "on_submit"):
 			self.purpose_cls(self).on_submit()
 
-		self.make_bundle_using_old_serial_batch_fields()
 		self.adjust_stock_reservation_entries_for_return()
 		self.update_stock_reservation_entries()
 		# Release the Work Order's own reservation for items being sent to the subcontractor
@@ -387,6 +387,7 @@ class StockEntry(StockController, SubcontractingInwardController):
 		self.update_cost_in_project()
 		self.update_quality_inspection()
 		super().on_submit_subcontracting_inward()
+		self.update_material_request_qty()
 
 	def on_cancel(self):
 		if self.purpose_cls and hasattr(self.purpose_cls, "on_cancel"):
@@ -422,6 +423,7 @@ class StockEntry(StockController, SubcontractingInwardController):
 		self.delete_auto_created_batches()
 		self.delete_linked_stock_entry()
 		super().on_cancel_subcontracting_inward()
+		self.update_material_request_qty()
 
 	def on_update(self):
 		super().on_update()
@@ -736,6 +738,18 @@ class StockEntry(StockController, SubcontractingInwardController):
 			raise_error_if_no_rate=raise_error_if_no_rate,
 			batch_no=d.batch_no,
 			serial_and_batch_bundle=d.serial_and_batch_bundle,
+			posting_datetime=get_combine_datetime(self.posting_date, self.posting_time),
+			creation=self.first_sle_creation,
+		)
+
+	@property
+	def first_sle_creation(self):
+		"""Creation of this entry's earliest ledger entry, if it has posted any yet."""
+		return frappe.db.get_value(
+			"Stock Ledger Entry",
+			{"voucher_no": self.name, "voucher_type": self.doctype, "is_cancelled": 0},
+			"creation",
+			order_by="creation asc",
 		)
 
 	def _notify_zero_valuation_rate(self, items):
@@ -756,7 +770,7 @@ class StockEntry(StockController, SubcontractingInwardController):
 			if d.s_warehouse:
 				if reset_outgoing_rate:
 					args = self.get_args_for_incoming_rate(d)
-					rate = get_incoming_rate(args, raise_error_if_no_rate)
+					rate = _get_incoming_rate(args, raise_error_if_no_rate)
 					if rate >= 0:
 						d.basic_rate = rate
 
@@ -1312,6 +1326,20 @@ class StockEntry(StockController, SubcontractingInwardController):
 
 		return False
 
+	def before_sl_preview(self):
+		self.release_work_order_reservation_for_preview()
+
+	def before_gl_preview(self):
+		self.release_work_order_reservation_for_preview()
+
+	def release_work_order_reservation_for_preview(self):
+		"""Releases the Work Order's own reservation as submit does, inside the rolled-back preview."""
+		if not self.is_stock_reserve_for_work_order():
+			return
+
+		self.db_set("docstatus", 1, update_modified=False)
+		self.pro_doc.update_required_items()
+
 	def update_wo_reservation_for_subcontracting(self):
 		# A "Send to Subcontractor" entry never keeps its `work_order` (validate clears it for this
 		# purpose), so the owning Work Order is derived from the Subcontracting Order / Purchase Order
@@ -1520,6 +1548,9 @@ class StockEntry(StockController, SubcontractingInwardController):
 		if self.pick_list:
 			return
 
+		if self.purpose in ("Manufacture", "Repack") and self.from_bom and not flt(self.fg_completed_qty):
+			frappe.throw(_("Please set Finished Good Quantity before fetching items from the BOM."))
+
 		self.set("items", [])
 		if self.purpose_cls and hasattr(self.purpose_cls, "add_items"):
 			self.purpose_cls(self).add_items()
@@ -1726,6 +1757,26 @@ class StockEntry(StockController, SubcontractingInwardController):
 
 		update_pick_list_status(self.pick_list)
 
+	def update_material_request_qty(self):
+		material_request_map = {}
+
+		for d in self.get("items"):
+			if d.material_request:
+				material_request_map.setdefault(d.material_request, []).append(d.material_request_item)
+
+		for mr, mr_item_rows in material_request_map.items():
+			if mr and mr_item_rows:
+				mr_obj = frappe.get_doc("Material Request", mr)
+
+				if mr_obj.status in ["Stopped", "Cancelled"]:
+					frappe.throw(
+						_("{0} {1} is cancelled or stopped").format(_("Material Request"), mr),
+						frappe.InvalidStatusError,
+					)
+
+				mr_obj.update_completed_qty(mr_item_rows)
+				mr_obj.update_requested_qty(mr_item_rows)
+
 	def set_missing_values(self):
 		"Updates rate and availability of all the items of mapped doc."
 		self.set_transfer_qty()
@@ -1735,6 +1786,12 @@ class StockEntry(StockController, SubcontractingInwardController):
 
 @frappe.whitelist()
 def make_stock_in_entry(source_name: str, target_doc: str | dict | Document | None = None):
+	qty_precision = frappe.get_precision("Stock Entry Detail", "transfer_qty")
+
+	def get_remaining_transfer_qty(source_doc):
+		remaining_qty = flt(source_doc.transfer_qty) - flt(source_doc.transferred_qty)
+		return flt(remaining_qty, qty_precision)
+
 	def set_missing_values(source, target):
 		target.stock_entry_type = "Material Transfer"
 		target.set_missing_values()
@@ -1754,7 +1811,7 @@ def make_stock_in_entry(source_name: str, target_doc: str | dict | Document | No
 				target_doc.t_warehouse = warehouse
 
 		target_doc.s_warehouse = source_doc.t_warehouse
-		target_doc.qty = source_doc.qty - source_doc.transferred_qty
+		target_doc.qty = get_remaining_transfer_qty(source_doc) / flt(source_doc.conversion_factor)
 
 	doclist = get_mapped_doc(
 		"Stock Entry",
@@ -1774,7 +1831,7 @@ def make_stock_in_entry(source_name: str, target_doc: str | dict | Document | No
 					"batch_no": "batch_no",
 				},
 				"postprocess": update_item,
-				"condition": lambda doc: flt(doc.qty) - flt(doc.transferred_qty) > 0.00001,
+				"condition": lambda doc: get_remaining_transfer_qty(doc) > 0,
 			},
 		},
 		target_doc,
@@ -1948,6 +2005,13 @@ def get_warehouse_details(args: str | dict):
 
 	args = frappe._dict(args)
 
+	# Restored explicitly: both checks were inherited from get_incoming_rate until it was split into
+	# a guarded whitelist wrapper and the unguarded _get_incoming_rate this now calls.
+	# `select`, not `read`: this is reached from stock_entry.js:740, and the desk roles that open
+	# that form clear select through the Desk User row while holding no Item read of their own.
+	frappe.has_permission("Item", ptype="select", throw=True)
+	check_warehouse_company(args.get("warehouse"))
+
 	ret = {}
 	if args.warehouse and args.item_code:
 		args.update(
@@ -1958,6 +2022,6 @@ def get_warehouse_details(args: str | dict):
 		)
 		ret = {
 			"actual_qty": get_previous_sle(args).get("qty_after_transaction") or 0,
-			"basic_rate": get_incoming_rate(args),
+			"basic_rate": _get_incoming_rate(args),
 		}
 	return ret

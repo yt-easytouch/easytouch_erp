@@ -11,8 +11,7 @@ import frappe
 import frappe.defaults
 from frappe import _, msgprint
 from frappe.model.document import Document
-from frappe.query_builder import Order
-from frappe.query_builder.functions import Min, Sum
+from frappe.query_builder.functions import Sum
 from frappe.utils import cint, flt, get_datetime, get_link_to_form, getdate, new_line_sep, nowdate
 
 from erpnext.buying.utils import check_on_hold_or_closed_status, validate_for_items
@@ -518,28 +517,6 @@ def is_valid_buying_price_list(price_list: str | None) -> bool:
 	return is_price_list_enabled(price_list) and bool(frappe.get_value("Price List", price_list, "buying"))
 
 
-def update_completed_and_requested_qty(stock_entry, method):
-	if stock_entry.doctype == "Stock Entry":
-		material_request_map = {}
-
-		for d in stock_entry.get("items"):
-			if d.material_request:
-				material_request_map.setdefault(d.material_request, []).append(d.material_request_item)
-
-		for mr, mr_item_rows in material_request_map.items():
-			if mr and mr_item_rows:
-				mr_obj = frappe.get_doc("Material Request", mr)
-
-				if mr_obj.status in ["Stopped", "Cancelled"]:
-					frappe.throw(
-						_("{0} {1} is cancelled or stopped").format(_("Material Request"), mr),
-						frappe.InvalidStatusError,
-					)
-
-				mr_obj.update_completed_qty(mr_item_rows)
-				mr_obj.update_requested_qty(mr_item_rows)
-
-
 def get_list_context(context=None):
 	from erpnext.controllers.website_list_for_contact import get_list_context
 
@@ -575,38 +552,41 @@ def get_material_requests_based_on_supplier(
 	if not supplier_items:
 		frappe.throw(_("{0} is not the default supplier for any items.").format(supplier))
 
-	mr = frappe.qb.DocType("Material Request")
-	mr_item = frappe.qb.DocType("Material Request Item")
+	mr_filters = [
+		["material_request_type", "=", "Purchase"],
+		["per_ordered", "<", 99.99],
+		["docstatus", "=", 1],
+		["status", "!=", "Stopped"],
+		["company", "=", filters.get("company")],
+	]
 
-	query = (
-		frappe.qb.from_(mr)
-		.from_(mr_item)
-		.select(mr.name, mr.transaction_date, mr.company)
-		.where(
-			(mr.name == mr_item.parent)
-			& (mr_item.item_code.isin(supplier_items))
-			& (mr.material_request_type == "Purchase")
-			& (mr.per_ordered < 99.99)
-			& (mr.docstatus == 1)
-			& (mr.status != "Stopped")
-			& (mr.company == filters.get("company"))
+	if frappe.has_permission("Material Request", "read"):
+		mr_filters.append(["Material Request Item", "item_code", "in", supplier_items])
+	else:
+		parents = frappe.get_all(
+			"Material Request Item",
+			filters={"item_code": ("in", supplier_items), "parenttype": "Material Request"},
+			pluck="parent",
+			distinct=True,
 		)
-		.groupby(mr.name, mr.transaction_date, mr.company)
-		.orderby(Min(mr_item.item_code), order=Order.asc)
-		.limit(cint(page_len))
-		.offset(cint(start))
-	)
+		mr_filters.append(["name", "in", parents or [""]])
 
 	if txt:
-		query = query.where(mr.name.like(f"%%{txt}%%"))
+		mr_filters.append(["name", "like", f"%{txt}%"])
 
 	if filters.get("transaction_date"):
 		date = filters.get("transaction_date")[1]
-		query = query.where(mr.transaction_date[date[0] : date[1]])
+		mr_filters.append(["transaction_date", "between", [date[0], date[1]]])
 
-	material_requests = query.run(as_dict=True)
-
-	return material_requests
+	return frappe.get_list(
+		"Material Request",
+		filters=mr_filters,
+		fields=["name", "transaction_date", "company"],
+		group_by="name",
+		order_by="name",
+		limit_start=cint(start),
+		limit_page_length=cint(page_len),
+	)
 
 
 @frappe.whitelist(methods=["POST"])

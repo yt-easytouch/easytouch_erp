@@ -16,7 +16,7 @@ from erpnext.accounts.doctype.accounting_dimension.accounting_dimension import (
 )
 from erpnext.accounts.report.financial_statements import get_cost_centers_with_children
 from erpnext.stock.report.stock_ledger.stock_ledger import get_item_group_condition
-from erpnext.stock.utils import get_incoming_rate
+from erpnext.stock.utils import _get_incoming_rate
 
 
 def execute(filters=None):
@@ -734,7 +734,7 @@ class GrossProfitGenerator:
 	def get_returned_invoice_items(self):
 		si = frappe.qb.DocType("Sales Invoice")
 		si_item = frappe.qb.DocType("Sales Invoice Item")
-		returned_invoices = (
+		query = (
 			frappe.qb.from_(si)
 			.inner_join(si_item)
 			.on(si.name == si_item.parent)
@@ -751,8 +751,12 @@ class GrossProfitGenerator:
 				& (si.is_return == 1)
 				& si.posting_date.between(self.filters.from_date, self.filters.to_date)
 			)
-			.run(as_dict=1)
 		)
+
+		if self.filters.company:
+			query = query.where(si.company == self.filters.company)
+
+		returned_invoices = query.run(as_dict=1)
 
 		self.returned_invoices = frappe._dict()
 		self.legacy_returned_invoices = frappe._dict()
@@ -969,7 +973,7 @@ class GrossProfitGenerator:
 			if row.serial_and_batch_bundle:
 				args.update({"serial_and_batch_bundle": row.serial_and_batch_bundle})
 
-			average_buying_rate = get_incoming_rate(args)
+			average_buying_rate = _get_incoming_rate(args)
 			self.average_buying_rate[key] = flt(average_buying_rate)
 
 		return self.average_buying_rate[key]

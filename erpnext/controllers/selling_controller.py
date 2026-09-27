@@ -11,9 +11,10 @@ from erpnext.accounts.party import render_address
 from erpnext.controllers.accounts_controller import get_taxes_and_charges
 from erpnext.controllers.sales_and_purchase_return import get_rate_for_return, is_batch_expired
 from erpnext.controllers.stock_controller import StockController
+from erpnext.selling.doctype.customer.customer import is_customer_blocked
 from erpnext.stock.doctype.item.item import set_item_default
 from erpnext.stock.get_item_details import get_bin_details, get_conversion_factor
-from erpnext.stock.utils import get_combine_datetime, get_incoming_rate, get_valuation_method
+from erpnext.stock.utils import _get_incoming_rate, get_combine_datetime, get_valuation_method
 
 
 class SellingController(StockController):
@@ -51,6 +52,7 @@ class SellingController(StockController):
 
 	def validate(self):
 		super().validate()
+		self.ensure_customer_is_not_blocked()
 		self.validate_items()
 		if not (self.get("is_debit_note") or self.get("is_return")):
 			self.validate_max_discount()
@@ -476,6 +478,13 @@ class SellingController(StockController):
 		so_warehouse = (so_item.warehouse if so_item else "") or ""
 		return so_qty, so_warehouse
 
+	def ensure_customer_is_not_blocked(self):
+		if self.doctype == "Quotation":
+			return
+
+		if self.customer and is_customer_blocked(self.customer):
+			frappe.throw(_("{0} is blocked so this transaction cannot proceed").format(self.customer))
+
 	def check_sales_order_on_hold_or_close(self, ref_fieldname):
 		if self.is_return:
 			return
@@ -588,7 +597,7 @@ class SellingController(StockController):
 						and self.get("is_return")
 					)
 				):
-					d.incoming_rate = get_incoming_rate(
+					d.incoming_rate = _get_incoming_rate(
 						{
 							"item_code": d.item_code,
 							"warehouse": d.warehouse,
@@ -1144,7 +1153,7 @@ def set_default_income_account_for_item(obj):
 	    obj: Transaction document containing items table with income_account field
 	"""
 	company_default = frappe.get_cached_value("Company", obj.company, "default_income_account")
-	for d in obj.get("items", default=[]):
+	for d in sorted(obj.get("items", default=[]), key=lambda row: row.item_code or ""):
 		income_account = getattr(d, "income_account", None)
 		if d.item_code and income_account and income_account != company_default:
 			set_item_default(d.item_code, obj.company, "income_account", income_account)
