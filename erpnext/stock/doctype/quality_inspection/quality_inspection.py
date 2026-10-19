@@ -3,6 +3,7 @@
 
 
 from math import isfinite
+from typing import Any
 
 import frappe
 from frappe import _
@@ -82,7 +83,6 @@ class QualityInspection(Document):
 				for d in parameters:
 					if reading.specification == d.specification:
 						reading.update(d)
-						reading.status = "Accepted"
 
 		if self.readings:
 			self.validate_reading_number_format()
@@ -154,7 +154,12 @@ class QualityInspection(Document):
 			)
 
 	def before_submit(self):
+		self.validate_sample_size()
 		self.validate_readings_status_mandatory()
+
+	def validate_sample_size(self):
+		if flt(self.sample_size) <= 0:
+			frappe.throw(_("Sample Size must be greater than zero"), title=_("Invalid Sample Size"))
 
 	@frappe.whitelist()
 	def get_item_specification_details(self):
@@ -264,6 +269,9 @@ class QualityInspection(Document):
 					"modified",
 					self.modified,
 				)
+
+		if self.reference_type and self.reference_name:
+			frappe.get_lazy_doc(self.reference_type, self.reference_name).notify_update()
 
 	def inspect_and_set_status(self):
 		for reading in self.readings:
@@ -413,7 +421,7 @@ class QualityInspection(Document):
 
 @frappe.whitelist()
 @frappe.validate_and_sanitize_search_inputs
-def item_query(doctype, txt, searchfield, start, page_len, filters):
+def item_query(doctype: Any, txt: str | None, searchfield: Any, start: int, page_len: int, filters: dict):
 	reference_doctype = filters.get("reference_doctype")
 
 	if not reference_doctype:
@@ -441,9 +449,9 @@ def item_query(doctype, txt, searchfield, start, page_len, filters):
 			my_filters.extend(
 				[
 					"and",
-					["items.type", "is", "not set"],
+					["items.secondary_item_type", "is", "not set"],
 					"and",
-					["items.is_legacy_scrap_item", "=", 0],
+					["items.valuation_type", "is", "not set"],
 				]
 			)
 			if purpose == "Manufacture":
@@ -514,7 +522,7 @@ def item_query(doctype, txt, searchfield, start, page_len, filters):
 @frappe.whitelist()
 @frappe.validate_and_sanitize_search_inputs
 def quality_inspection_query(doctype, txt, searchfield, start, page_len, filters):
-	return frappe.get_all(
+	return frappe.get_list(
 		"Quality Inspection",
 		limit_start=start,
 		limit_page_length=page_len,

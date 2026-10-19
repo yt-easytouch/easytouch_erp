@@ -110,30 +110,63 @@ class SerialBatchBundle:
 		):
 			return True
 
-	def make_serial_batch_no_bundle_for_material_transfer(self):
-		from erpnext.controllers.stock_controller import make_bundle_for_material_transfer
+	def get_transit_package(self) -> str | None:
+		if self.sle.is_cancelled or self.sle.voucher_type not in ["Delivery Note", "Sales Invoice"]:
+			return None
 
-		bundle = frappe.db.get_value(
-			"Stock Entry Detail", self.sle.voucher_detail_no, "serial_and_batch_bundle"
+		return frappe.db.get_value(
+			"Stock Ledger Entry",
+			{
+				"voucher_no": self.sle.voucher_no,
+				"voucher_detail_no": self.sle.voucher_detail_no,
+				"item_code": self.sle.item_code,
+				"actual_qty": ("<", 0),
+				"is_cancelled": 0,
+				"serial_and_batch_bundle": ("is", "set"),
+			},
+			"serial_and_batch_bundle",
+			order_by="creation desc",
 		)
 
-		if bundle:
-			new_bundle_id = make_bundle_for_material_transfer(
-				is_new=False,
-				docstatus=1,
-				voucher_type=self.sle.voucher_type,
-				voucher_no=self.sle.voucher_no,
-				serial_and_batch_bundle=bundle,
-				warehouse=self.sle.warehouse,
-				type_of_transaction="Inward" if self.sle.actual_qty > 0 else "Outward",
-				do_not_submit=0,
-			)
-			self.sle.db_set({"serial_and_batch_bundle": new_bundle_id})
+	def make_serial_batch_no_bundle_for_material_transfer(self, bundle):
+		from erpnext.controllers.stock_controller import make_bundle_for_material_transfer
+
+		if not bundle:
+			return
+
+		new_bundle_id = make_bundle_for_material_transfer(
+			is_new=False,
+			docstatus=1,
+			voucher_type=self.sle.voucher_type,
+			voucher_no=self.sle.voucher_no,
+			serial_and_batch_bundle=bundle,
+			warehouse=self.sle.warehouse,
+			type_of_transaction="Inward" if self.sle.actual_qty > 0 else "Outward",
+			do_not_submit=0,
+		)
+		self.sle.db_set({"serial_and_batch_bundle": new_bundle_id})
 
 	def make_serial_batch_no_bundle(self):
+		if self.sle.actual_qty > 0 and (transit_package := self.get_transit_package()):
+			self.make_serial_batch_no_bundle_for_material_transfer(transit_package)
+
+			if not self.is_packed_entry():
+				frappe.db.set_value(
+					self.child_doctype,
+					self.sle.voucher_detail_no,
+					"serial_and_batch_bundle",
+					self.sle.serial_and_batch_bundle,
+				)
+
+			return
+
 		self.validate_item()
 		if self.sle.actual_qty > 0 and self.is_material_transfer():
-			self.make_serial_batch_no_bundle_for_material_transfer()
+			self.make_serial_batch_no_bundle_for_material_transfer(
+				frappe.db.get_value(
+					"Stock Entry Detail", self.sle.voucher_detail_no, "serial_and_batch_bundle"
+				)
+			)
 			return
 
 		sn_doc = SerialBatchCreation(
@@ -314,6 +347,7 @@ class SerialBatchBundle:
 					)
 					and self.sle.actual_qty < 0
 				)
+				or (self.sle.actual_qty > 0 and self.get_transit_package())
 			)
 		):
 			self.make_serial_batch_no_bundle()
@@ -787,6 +821,9 @@ class SerialNoValuation(DeprecatedSerialNoValuation):
 		return is_rejected(self.sle.voucher_type, self.sle.voucher_detail_no, self.sle.warehouse)
 
 	def get_incoming_rate(self):
+		if not self.sle.actual_qty and self.sle.voucher_type == "Stock Reconciliation":
+			return 0.0
+
 		return abs(flt(self.stock_value_change) / flt(self.sle.actual_qty))
 
 	def get_incoming_rate_of_serial_no(self, serial_no):
@@ -820,19 +857,66 @@ class BatchNoValuation(DeprecatedBatchNoValuation):
 				"Serial and Batch Bundle", self.sle.serial_and_batch_bundle, "total_amount"
 			)
 		else:
-			entries = self.get_batch_stock_before_date()
 			self.stock_value_change = 0.0
 			self.batch_avg_rate = defaultdict(float)
 			self.available_qty = defaultdict(float)
 			self.stock_value_differece = defaultdict(float)
 
-			for ledger in entries:
+			self.seed_from_stock_closing_balance()
+
+			for ledger in self.get_batch_stock_before_date():
 				self.stock_value_differece[ledger.batch_no] += flt(ledger.incoming_rate)
 				self.available_qty[ledger.batch_no] += flt(ledger.qty)
 
 			self.calculate_avg_rate_from_deprecarated_ledgers()
 			self.calculate_avg_rate_for_non_batchwise_valuation()
 			self.set_stock_value_difference()
+
+	def seed_from_stock_closing_balance(self):
+		self.stock_closing_from_datetime = None
+		closing_entry = self.get_closing_entry_for_seeding()
+		if not closing_entry:
+			return
+
+		from erpnext.stock.utils import get_combine_datetime
+
+		self.stock_closing_from_datetime = get_combine_datetime(
+			add_days(closing_entry.to_date, 1), "00:00:00"
+		)
+
+		for row in self.get_stock_closing_balance_entries(closing_entry.name):
+			self.stock_value_differece[row.batch_no] += flt(row.stock_value_difference)
+			self.available_qty[row.batch_no] += flt(row.actual_qty)
+
+	def get_closing_entry_for_seeding(self):
+		from erpnext.stock.doctype.stock_closing_entry.stock_closing_entry import (
+			get_closing_entry_for_closed_period,
+		)
+
+		if not self.batchwise_valuation_batches or not self.sle.posting_date:
+			return None
+
+		company = self.sle.company or frappe.get_cached_value("Warehouse", self.sle.warehouse, "company")
+		closing_entry = get_closing_entry_for_closed_period(company)
+		if not closing_entry or getdate(self.sle.posting_date) <= getdate(closing_entry.to_date):
+			return None
+
+		return closing_entry
+
+	def get_stock_closing_balance_entries(self, closing_entry):
+		table = frappe.qb.DocType("Stock Closing Balance")
+
+		return (
+			frappe.qb.from_(table)
+			.select(table.batch_no, table.actual_qty, table.stock_value_difference)
+			.where(
+				(table.stock_closing_entry == closing_entry)
+				& (table.item_code == self.sle.item_code)
+				& (table.warehouse == self.sle.warehouse)
+				& table.batch_no.isin(self.batchwise_valuation_batches)
+				& (table.inventory_dimension_key.isnull() | (table.inventory_dimension_key == ""))
+			)
+		).run(as_dict=True)
 
 	def get_batch_stock_before_date(self) -> list[dict]:
 		# Get batch wise stock value difference from Serial and Batch Bundle considering time condition
@@ -841,14 +925,45 @@ class BatchNoValuation(DeprecatedBatchNoValuation):
 
 		child = frappe.qb.DocType("Serial and Batch Entry")
 
+		sle_creation = self.sle.creation if self.sle.get("name") else None
+		if not self.sle.get("name") and self.sle.get("serial_and_batch_bundle"):
+			sle_creation = frappe.db.get_value(
+				"Stock Ledger Entry",
+				{"serial_and_batch_bundle": self.sle.serial_and_batch_bundle, "is_cancelled": 0},
+				"creation",
+			)
+
 		timestamp_condition = ""
 		if self.sle.posting_datetime:
 			timestamp_condition = child.posting_datetime < self.sle.posting_datetime
 
-			if self.sle.creation:
-				timestamp_condition |= (child.posting_datetime == self.sle.posting_datetime) & (
-					child.creation < self.sle.creation
+			sle_table = frappe.qb.DocType("Stock Ledger Entry")
+			if sle_creation:
+				# bundle creation and SLE creation are different timelines (a
+				# bundle can be created much before its SLE), so break the tie
+				# using the creation of the bundle's own SLE
+				tie_condition = ExistsCriterion(
+					frappe.qb.from_(sle_table)
+					.select(sle_table.name)
+					.where(
+						(sle_table.serial_and_batch_bundle == child.parent)
+						& (sle_table.is_cancelled == 0)
+						& (sle_table.creation < sle_creation)
+					)
 				)
+			else:
+				# the current entry is not yet in the ledger and will get the
+				# latest creation, so the same-timestamp entries which are
+				# already in the ledger precede it
+				tie_condition = ExistsCriterion(
+					frappe.qb.from_(sle_table)
+					.select(sle_table.name)
+					.where(
+						(sle_table.serial_and_batch_bundle == child.parent) & (sle_table.is_cancelled == 0)
+					)
+				)
+
+			timestamp_condition |= (child.posting_datetime == self.sle.posting_datetime) & tie_condition
 
 		query = (
 			frappe.qb.from_(child)
@@ -862,6 +977,7 @@ class BatchNoValuation(DeprecatedBatchNoValuation):
 				& (child.warehouse == self.sle.warehouse)
 				& (child.batch_no.isin(self.batchwise_valuation_batches))
 				& (child.docstatus == 1)
+				& (child.is_cancelled == 0)
 				& (child.type_of_transaction.isin(["Inward", "Outward"]))
 			)
 			.for_update()
@@ -878,6 +994,9 @@ class BatchNoValuation(DeprecatedBatchNoValuation):
 		if timestamp_condition:
 			query = query.where(timestamp_condition)
 
+		if self.stock_closing_from_datetime:
+			query = query.where(child.posting_datetime >= self.stock_closing_from_datetime)
+
 		return query.run(as_dict=True)
 
 	def prepare_batches(self):
@@ -889,6 +1008,11 @@ class BatchNoValuation(DeprecatedBatchNoValuation):
 
 		self.batchwise_valuation_batches = []
 		self.non_batchwise_valuation_batches = []
+
+		if batchwise_batches := self.sle.get("batchwise_valuation_batches"):
+			self.batchwise_valuation_batches = list(batchwise_batches)
+			self.non_batchwise_valuation_batches = list(set(self.batches) - set(batchwise_batches))
+			return
 
 		if get_valuation_method(
 			self.sle.item_code, self.sle.company
@@ -1232,6 +1356,7 @@ class SerialBatchCreation:
 			{
 				"item_code": self.item_code,
 				"warehouse": self.warehouse,
+				"company": self.get("company"),
 				"qty": abs(self.actual_qty) if self.actual_qty else 0,
 				"based_on": frappe.get_single_value("Stock Settings", "pick_serial_and_batch_based_on"),
 			}
@@ -1239,6 +1364,9 @@ class SerialBatchCreation:
 
 		if self.get("ignore_serial_nos"):
 			kwargs["ignore_serial_nos"] = self.ignore_serial_nos
+
+		if self.get("already_picked_batches"):
+			kwargs["already_picked_batches"] = self.already_picked_batches
 
 		if (
 			self.has_serial_no

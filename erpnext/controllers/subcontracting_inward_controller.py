@@ -130,6 +130,7 @@ class SubcontractingInwardController:
 					)
 				)
 
+			precision = item.precision("transfer_qty")
 			if self.purpose == "Return Raw Material to Customer":
 				data = frappe.get_value(
 					"Subcontracting Inward Order Received Item",
@@ -137,7 +138,9 @@ class SubcontractingInwardController:
 					["received_qty", "returned_qty", "work_order_qty"],
 					as_dict=True,
 				)
-				if data.returned_qty + item.transfer_qty > data.received_qty - data.work_order_qty:
+				if flt(data.returned_qty + item.transfer_qty, precision) > flt(
+					data.received_qty - data.work_order_qty, precision
+				):
 					frappe.throw(
 						_(
 							"Row #{0}: Returned quantity cannot be greater than available quantity for Item {1}"
@@ -150,7 +153,7 @@ class SubcontractingInwardController:
 					["returned_qty", "delivered_qty"],
 					as_dict=True,
 				)
-				if item.transfer_qty > data.delivered_qty - data.returned_qty:
+				if flt(item.transfer_qty, precision) > flt(data.delivered_qty - data.returned_qty, precision):
 					frappe.throw(
 						_(
 							"Row #{0}: Returned quantity cannot be greater than available quantity to return for Item {1}"
@@ -241,8 +244,8 @@ class SubcontractingInwardController:
 			item
 			for item in self.get("items")
 			if not item.is_finished_item
-			and not item.type
-			and not item.is_legacy_scrap_item
+			and not item.secondary_item_type
+			and not item.valuation_type
 			and frappe.get_cached_value("Item", item.item_code, "is_customer_provided_item")
 		]
 
@@ -372,7 +375,7 @@ class SubcontractingInwardController:
 			if self.purpose in ["Subcontracting Delivery", "Subcontracting Return", "Manufacture"]:
 				for item in self.items:
 					if (
-						item.is_finished_item or item.type or item.is_legacy_scrap_item
+						item.is_finished_item or item.secondary_item_type or item.valuation_type
 					) and item.valuation_rate == 0:
 						item.allow_zero_valuation_rate = 1
 
@@ -472,7 +475,7 @@ class SubcontractingInwardController:
 				self.validate_delivery_on_save()
 			else:
 				for item in self.items:
-					if not item.type and not item.is_legacy_scrap_item:
+					if not item.secondary_item_type and not item.valuation_type:
 						delivered_qty, returned_qty = frappe.get_value(
 							"Subcontracting Inward Order Item",
 							item.scio_detail,
@@ -543,7 +546,7 @@ class SubcontractingInwardController:
 						bold(
 							frappe.get_cached_value(
 								"Subcontracting Inward Order Item"
-								if not item.type and not item.is_legacy_scrap_item
+								if not item.secondary_item_type and not item.valuation_type
 								else "Subcontracting Inward Order Secondary Item",
 								item.scio_detail,
 								"stock_uom",
@@ -595,7 +598,7 @@ class SubcontractingInwardController:
 				)
 
 			for item in [item for item in self.items if not item.is_finished_item]:
-				if item.type or item.is_legacy_scrap_item:
+				if item.secondary_item_type or item.valuation_type:
 					scio_secondary_item = frappe.get_value(
 						"Subcontracting Inward Order Secondary Item",
 						{
@@ -655,7 +658,7 @@ class SubcontractingInwardController:
 			for item in self.items:
 				doctype = (
 					"Subcontracting Inward Order Item"
-					if not item.type and not item.is_legacy_scrap_item
+					if not item.secondary_item_type and not item.valuation_type
 					else "Subcontracting Inward Order Secondary Item"
 				)
 				qty_map[doctype][item.scio_detail] += (
@@ -730,7 +733,7 @@ class SubcontractingInwardController:
 						"Subcontracting Inward Order Item", item.against_fg, "item_code"
 					),
 				)
-				scio_rm.insert()
+				scio_rm.insert(ignore_permissions=True)
 				scio_rm.submit()
 				item.db_set("scio_detail", scio_rm.name)
 
@@ -772,7 +775,9 @@ class SubcontractingInwardController:
 				)
 
 				if not d.required_qty and not d.received_qty:
-					frappe.delete_doc("Subcontracting Inward Order Received Item", d.name)
+					frappe.delete_doc(
+						"Subcontracting Inward Order Received Item", d.name, ignore_permissions=True
+					)
 				else:
 					doc_updates[d.name] = {"received_qty": d.received_qty, "rate": d.rate}
 
@@ -791,7 +796,7 @@ class SubcontractingInwardController:
 		items = [
 			item
 			for item in self.items
-			if not item.is_finished_item and not item.type and not item.is_legacy_scrap_item
+			if not item.is_finished_item and not item.secondary_item_type and not item.valuation_type
 		]
 		item_code_wh = frappe._dict(
 			{
@@ -849,7 +854,9 @@ class SubcontractingInwardController:
 				if qty or d.is_customer_provided_item or not d.is_additional_item:
 					doc_updates[d.name] = {"consumed_qty": qty}
 				else:
-					frappe.delete_doc("Subcontracting Inward Order Received Item", d.name)
+					frappe.delete_doc(
+						"Subcontracting Inward Order Received Item", d.name, ignore_permissions=True
+					)
 
 			if doc_updates:
 				frappe.db.bulk_update(
@@ -888,12 +895,14 @@ class SubcontractingInwardController:
 					warehouse=extra_item.s_warehouse,
 					is_additional_item=True,
 				)
-				doc.insert()
+				doc.insert(ignore_permissions=True)
 				doc.submit()
 
 	def update_inward_order_secondary_items(self):
 		if (scio := self.subcontracting_inward_order) and self.purpose == "Manufacture":
-			secondary_items_list = [item for item in self.items if item.type or item.is_legacy_scrap_item]
+			secondary_items_list = [
+				item for item in self.items if item.secondary_item_type or item.valuation_type
+			]
 
 			secondary_items = defaultdict(float)
 			for item in secondary_items_list:
@@ -935,7 +944,11 @@ class SubcontractingInwardController:
 							self._action == "cancel"
 							and value.produced_qty - abs(secondary_items.get(key)) == 0
 						):
-							frappe.delete_doc("Subcontracting Inward Order Secondary Item", value.name)
+							frappe.delete_doc(
+								"Subcontracting Inward Order Secondary Item",
+								value.name,
+								ignore_permissions=True,
+							)
 						else:
 							doc_updates[value.name] = {
 								"produced_qty": value.produced_qty + secondary_items.get(key)
@@ -967,13 +980,13 @@ class SubcontractingInwardController:
 						stock_uom=secondary_item.stock_uom,
 						warehouse=secondary_item.t_warehouse,
 						produced_qty=secondary_item.transfer_qty,
-						type=secondary_item.type,
+						secondary_item_type=secondary_item.secondary_item_type,
 						delivered_qty=0,
 						reference_name=frappe.get_value(
 							"Work Order", self.work_order, "subcontracting_inward_order_item"
 						),
 					)
-					doc.insert()
+					doc.insert(ignore_permissions=True)
 					doc.submit()
 
 	def cancel_stock_reservation_entries_for_inward(self):
@@ -1143,7 +1156,11 @@ def get_fg_reference_names(doctype, txt, searchfield, start, page_len, filters):
 		"Subcontracting Inward Order Item",
 		limit_start=start,
 		limit_page_length=page_len,
-		filters={"parent": filters.get("parent"), "item_code": ("like", "%%%s%%" % txt), "docstatus": 1},
+		filters={"parent": filters.get("parent"), "docstatus": 1},
+		or_filters=[
+			["name", "like", "%%%s%%" % txt],
+			["item_code", "like", "%%%s%%" % txt],
+		],
 		fields=["name", "item_code", "delivery_warehouse"],
 		as_list=True,
 		order_by="idx",

@@ -59,7 +59,7 @@ erpnext.sales_common = {
 
 				if (this.frm.fields_dict.selling_price_list) {
 					this.frm.set_query("selling_price_list", function () {
-						return { filters: { selling: 1 } };
+						return { filters: { selling: 1, enabled: 1 } };
 					});
 				}
 
@@ -583,34 +583,39 @@ erpnext.sales_common = {
 };
 
 erpnext.pre_sales = {
+	// also used by the Opportunity Kanban board
+	lost_reason_fields: function (doctype) {
+		return [
+			{
+				fieldtype: "Table MultiSelect",
+				label: __("Lost Reasons"),
+				fieldname: "lost_reason",
+				options:
+					doctype === "Opportunity"
+						? "Opportunity Lost Reason Detail"
+						: "Quotation Lost Reason Detail",
+				reqd: 1,
+			},
+			{
+				fieldtype: "Table MultiSelect",
+				label: __("Competitors"),
+				fieldname: "competitors",
+				options: "Competitor Detail",
+			},
+			{
+				fieldtype: "Small Text",
+				label: __("Detailed Reason"),
+				fieldname: "detailed_reason",
+			},
+		];
+	},
+
 	set_as_lost: function (doctype) {
 		frappe.ui.form.on(doctype, {
 			set_as_lost_dialog: function (frm) {
 				var dialog = new frappe.ui.Dialog({
 					title: __("Set as Lost"),
-					fields: [
-						{
-							fieldtype: "Table MultiSelect",
-							label: __("Lost Reasons"),
-							fieldname: "lost_reason",
-							options:
-								frm.doctype === "Opportunity"
-									? "Opportunity Lost Reason Detail"
-									: "Quotation Lost Reason Detail",
-							reqd: 1,
-						},
-						{
-							fieldtype: "Table MultiSelect",
-							label: __("Competitors"),
-							fieldname: "competitors",
-							options: "Competitor Detail",
-						},
-						{
-							fieldtype: "Small Text",
-							label: __("Detailed Reason"),
-							fieldname: "detailed_reason",
-						},
-					],
+					fields: erpnext.pre_sales.lost_reason_fields(frm.doctype),
 					primary_action: function () {
 						let values = dialog.get_values();
 

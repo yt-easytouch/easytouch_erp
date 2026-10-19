@@ -34,6 +34,7 @@ from erpnext.controllers.item_variant import (
 	validate_item_variant_attributes,
 )
 from erpnext.stock.doctype.item_default.item_default import ItemDefault
+from erpnext.stock.serial_batch_bundle import SerialBatchCreation
 from erpnext.stock.utils import get_valuation_method
 
 
@@ -145,6 +146,7 @@ class Item(Document):
 		taxes: DF.Table[ItemTax]
 		total_projected_qty: DF.Float
 		uoms: DF.Table[UOMConversionDetail]
+		use_serial_no_wise_valuation: DF.Check
 		valuation_method: DF.Literal["", "FIFO", "Moving Average", "LIFO"]
 		valuation_rate: DF.Currency
 		variant_based_on: DF.Literal["Item Attribute", "Manufacturer"]
@@ -190,7 +192,24 @@ class Item(Document):
 			)
 
 		if self.opening_stock:
-			self.set_opening_stock()
+			if self.opening_stock > 10000 and self.has_serial_no:
+				frappe.enqueue(
+					self.set_opening_stock,
+					queue="long",
+					timeout=600,
+					job_name=f"set_opening_stock_for_{self.name}",
+					enqueue_after_commit=True,
+				)
+				frappe.msgprint(
+					_(
+						"Opening stock creation has been queued and will be created in the background. Please check the Stock Reconciliation after some time."
+					),
+					indicator="orange",
+					alert=True,
+				)
+
+			else:
+				self.set_opening_stock()
 
 	def validate(self):
 		if not self.item_name:
@@ -202,6 +221,9 @@ class Item(Document):
 		self.validate_conversion_factor()
 		self.validate_item_type()
 		self.validate_naming_series()
+		if self.is_new():
+			self.validate_opening_stock()
+		self.validate_shelf_life()
 		self.check_for_active_boms()
 		self.fill_customer_code()
 		self.check_item_tax()
@@ -224,16 +246,22 @@ class Item(Document):
 		self.update_defaults_from_item_group()
 		self.validate_item_defaults()
 		self.validate_auto_reorder_enabled_in_stock_settings()
+		self.validate_serial_and_batch_no_enabled_in_stock_settings()
 		self.cant_change()
 		self.validate_serialized_change_with_bundle()
+		self.validate_serial_no_wise_valuation()
+		self.set_valuation_method_for_serial_no_wise_valuation()
 		self.validate_item_tax_net_rate_range()
 
 		if not self.is_new():
 			self.old_item_group = frappe.db.get_value(self.doctype, self.name, "item_group")
 
 	def on_update(self):
+		from erpnext.stock.utils import clear_valuation_method_cache
+
 		self.update_variants()
 		self.update_item_price()
+		clear_valuation_method_cache()
 
 	def validate_description(self):
 		"""Clean HTML description if set"""
@@ -273,7 +301,7 @@ class Item(Document):
 		if not price_list:
 			price_list = frappe.get_single_value(
 				"Selling Settings", "selling_price_list"
-			) or frappe.db.get_value("Price List", _("Standard Selling"))
+			) or frappe.db.get_value("Price List", "Standard Selling")
 		if price_list:
 			item_price = frappe.get_doc(
 				{
@@ -288,64 +316,75 @@ class Item(Document):
 			)
 			item_price.insert()
 
+	def validate_opening_stock(self):
+		if not self.is_stock_item or not self.opening_stock:
+			return
+
+		if self.has_serial_no and not self.serial_no_series:
+			frappe.throw(
+				_("Serial Number Series is mandatory when entering Opening Stock for a serialized item.")
+			)
+
+		if self.has_batch_no and not self.create_new_batch:
+			frappe.throw(
+				_("Enable Automatically Create New Batch when entering Opening Stock for a batched item.")
+			)
+
 	def set_opening_stock(self):
 		"""set opening stock"""
-		if not self.is_stock_item or self.has_serial_no or self.has_batch_no:
+		if not self.is_stock_item:
 			return
 
 		if self.valuation_rate is None and not self.is_customer_provided_item:
 			frappe.throw(_("Valuation Rate is mandatory if Opening Stock entered"))
 
-		from erpnext.stock.doctype.stock_entry.stock_entry_utils import make_stock_entry
-
-		# default warehouse, or Stores
 		for default in self.item_defaults or [
 			frappe._dict({"company": frappe.defaults.get_defaults().company})
 		]:
-			default_warehouse = default.default_warehouse or frappe.get_single_value(
-				"Stock Settings", "default_warehouse"
-			)
-			if default_warehouse:
-				warehouse_company = frappe.db.get_value("Warehouse", default_warehouse, "company")
+			default_warehouse = default.default_warehouse
+			if not default_warehouse and default.company:
+				default_warehouse = frappe.get_cached_value("Company", default.company, "default_warehouse")
 
-			if not default_warehouse or warehouse_company != default.company:
+			if not default_warehouse:
 				default_warehouse = frappe.db.get_value(
 					"Warehouse", {"warehouse_name": _("Stores"), "company": default.company}
 				)
 
 			if default_warehouse:
-				stock_entry = make_stock_entry(
-					item_code=self.name,
-					target=default_warehouse,
-					qty=self.opening_stock,
-					rate=self.valuation_rate,
-					company=default.company,
-					posting_date=getdate(),
-					posting_time=nowtime(),
-					do_not_save=True,
+				opening_account = frappe.db.get_value(
+					"Account",
+					{"company": default.company, "account_type": "Temporary", "is_group": 0},
+					"name",
 				)
 
-				if self.valuation_rate == 0:
-					for item in stock_entry.items:
-						item.allow_zero_valuation_rate = 1
+				if not opening_account:
+					frappe.throw(
+						_(
+							"Please set a Temporary Opening account for company {0} to create an Opening Stock reconciliation."
+						).format(frappe.bold(default.company))
+					)
+				stock_reco = create_opening_stock_reconciliation(
+					item_code=self.name,
+					company=default.company,
+					qty=self.opening_stock,
+					valuation_rate=self.valuation_rate,
+					warehouse=default_warehouse,
+					expense_account=opening_account,
+				)
+				stock_reco.add_comment("Comment", _("Opening Stock"))
 
-				stock_entry.insert()
-				stock_entry.submit()
-				stock_entry.load_from_db()
-				stock_entry.add_comment("Comment", _("Opening Stock"))
-
-				stock_entry_link = frappe.utils.get_link_to_form("Stock Entry", stock_entry.name)
+				stock_reco_link = frappe.utils.get_link_to_form("Stock Reconciliation", stock_reco.name)
 				if self.valuation_rate == 0:
 					frappe.msgprint(
-						_("Opening Stock entry created with zero valuation rate: {0}").format(
-							stock_entry_link
+						_("Opening Stock reconciliation created with zero valuation rate: {0}").format(
+							stock_reco_link
 						),
 						indicator="orange",
 						alert=True,
 					)
 				else:
 					frappe.msgprint(
-						_("Opening Stock entry created: {0}").format(stock_entry_link),
+						_("Opening Stock reconciliation created: {0}").format(stock_reco_link),
 						indicator="green",
 						alert=True,
 					)
@@ -368,13 +407,28 @@ class Item(Document):
 				)
 
 	def validate_retain_sample(self):
-		if self.retain_sample and not frappe.get_single_value("Stock Settings", "sample_retention_warehouse"):
-			frappe.throw(_("Please select Sample Retention Warehouse in Stock Settings first"))
+		if self.retain_sample and not frappe.db.exists(
+			"Company", {"sample_retention_warehouse": ("is", "set")}
+		):
+			frappe.throw(_("Please select Sample Retention Warehouse in Company first"))
 		if self.retain_sample and not self.has_batch_no:
 			frappe.throw(
 				_(
 					"{0} Retain Sample is based on batch, please check Has Batch No to retain sample of item"
 				).format(self.item_code)
+			)
+
+	def validate_shelf_life(self):
+		if (
+			self.has_batch_no
+			and self.has_expiry_date
+			and self.create_new_batch
+			and cint(self.shelf_life_in_days) <= 0
+		):
+			frappe.throw(
+				_("{0} must be greater than zero.").format(
+					self.get_label_from_fieldname("shelf_life_in_days")
+				)
 			)
 
 	def clear_retain_sample(self):
@@ -710,7 +764,7 @@ class Item(Document):
 
 	def set_last_purchase_rate(self, new_name):
 		last_purchase_rate = get_last_purchase_details(new_name).get("base_net_rate", 0)
-		frappe.db.set_value("Item", new_name, "last_purchase_rate", last_purchase_rate)
+		frappe.db.set_value("Item", new_name, "last_purchase_rate", last_purchase_rate, update_modified=False)
 
 	def recalculate_bin_qty(self, new_name):
 		from erpnext.stock.stock_balance import repost_stock
@@ -1021,11 +1075,12 @@ class Item(Document):
 					)
 
 	def validate_uom_conversion_factor(self):
-		if self.uoms:
-			for d in self.uoms:
-				value = get_uom_conv_factor(d.uom, self.stock_uom)
-				if value:
-					d.conversion_factor = value
+		for d in self.get("uoms"):
+			if not d.conversion_factor:
+				d.conversion_factor = get_uom_conv_factor(d.uom, self.stock_uom)
+
+			if flt(d.conversion_factor) <= 0:
+				frappe.throw(_("Row {0}: Conversion Factor must be greater than zero.").format(d.idx))
 
 	def validate_attributes(self):
 		if not (self.has_variants or self.variant_of):
@@ -1113,6 +1168,49 @@ class Item(Document):
 
 			frappe.throw(msg, title=_("Linked with submitted documents"))
 
+	def validate_serial_no_wise_valuation(self):
+		if self.is_new() or not self._doc_before_save:
+			return
+
+		if not self.use_serial_no_wise_valuation or self._doc_before_save.use_serial_no_wise_valuation:
+			return
+
+		if frappe.db.exists("Serial No", {"item_code": self.name}):
+			frappe.throw(
+				_(
+					"Serial No Wise Valuation cannot be enabled for Item {0} because Serial Nos already exist for it. Valuation for those Serial Nos was not tracked, so enabling it now would value outward entries incorrectly."
+				).format(frappe.bold(self.name)),
+				title=_("Serial Nos Exist"),
+			)
+
+	def set_valuation_method_for_serial_no_wise_valuation(self):
+		if not self.has_serial_no or self.use_serial_no_wise_valuation:
+			return
+
+		# Only the switch turning off forces Moving Average, because the per serial costs already in the
+		# ledger cannot be replayed as a FIFO queue. An item that has always had the switch off keeps its
+		# own method, so an unrelated save cannot silently revalue a ledger nothing reposts.
+		if self._doc_before_save and not self._doc_before_save.use_serial_no_wise_valuation:
+			return
+
+		if not frappe.db.exists("Stock Ledger Entry", {"item_code": self.name, "is_cancelled": 0}):
+			return
+
+		if (
+			not self.is_new()
+			and self._doc_before_save
+			and self.has_value_changed("valuation_method")
+			and self.valuation_method in ("FIFO", "LIFO")
+		):
+			frappe.throw(
+				_(
+					"Valuation Method for Item {0} must be Moving Average because Serial No Wise Valuation is disabled. Enable Serial No Wise Valuation to use FIFO or LIFO."
+				).format(frappe.bold(self.name)),
+				title=_("Invalid Valuation Method"),
+			)
+
+		self.valuation_method = "Moving Average"
+
 	def validate_serialized_change_with_bundle(self):
 		"""Block turning a serialized item non-serialized while any Serial and Batch Bundle still exists
 		for it. Such bundles carry the item's serial numbers; the user must delete or cancel them first."""
@@ -1150,6 +1248,7 @@ class Item(Document):
 				"Sales Order Item",
 				"Purchase Order Item",
 				"Material Request Item",
+				"Work Order Item",
 				"Product Bundle",
 				"BOM",
 			]
@@ -1197,6 +1296,22 @@ class Item(Document):
 					msg=_("You have to enable auto re-order in Stock Settings to maintain re-order levels."),
 					title=_("Enable Auto Re-Order"),
 					indicator="orange",
+				)
+
+	def validate_serial_and_batch_no_enabled_in_stock_settings(self):
+		if frappe.get_single_value("Stock Settings", "enable_serial_and_batch_no_for_item"):
+			return
+
+		doc_before_save = self.get_doc_before_save()
+		for fieldname in ("has_serial_no", "has_batch_no"):
+			if cint(self.get(fieldname)) and not (doc_before_save and cint(doc_before_save.get(fieldname))):
+				frappe.throw(
+					_("Cannot enable {0} as {1} is disabled in {2}").format(
+						bold(self.meta.get_label(fieldname)),
+						bold(_("Activate Serial / Batch No for Item")),
+						get_link_to_form("Stock Settings", "Stock Settings"),
+					),
+					title=_("Serial / Batch No Not Activated"),
 				)
 
 
@@ -1432,6 +1547,7 @@ def set_item_default(item_code, company, fieldname, value):
 		if d.company == company:
 			if not d.get(fieldname):
 				frappe.db.set_value(d.doctype, d.name, fieldname, value)
+				item.clear_cache()
 			return
 
 	# no row found, add a new row for the company
@@ -1442,18 +1558,28 @@ def set_item_default(item_code, company, fieldname, value):
 
 @frappe.whitelist()
 def get_item_details(item_code, company=None):
+	# The whitelisted entry point authorises; _get_item_details does not. Deliberately not an
+	# `ignore_permissions` argument: this is whitelisted, so a caller could pass it and skip the check.
+	return _get_item_details(item_code, company, ignore_permissions=False)
+
+
+def _get_item_details(item_code, company=None, ignore_permissions=True):
+	doc = frappe.get_cached_doc("Item", item_code)
+	if not ignore_permissions:
+		# the whole Item document is returned below, so the record itself has to be authorised.
+		doc.check_permission()
+
 	out = frappe._dict()
 	if company:
 		out = get_item_defaults(item_code, company) or frappe._dict()
 
-	doc = frappe.get_cached_doc("Item", item_code)
 	out.update(doc.as_dict())
 
 	return out
 
 
 @frappe.whitelist()
-def get_uom_conv_factor(uom, stock_uom):
+def get_uom_conv_factor(uom: str | None, stock_uom: str | None):
 	"""Get UOM conversion factor from uom to stock_uom
 	e.g. uom = "Kg", stock_uom = "Gram" then returns 1000.0
 	"""
@@ -1472,7 +1598,7 @@ def get_uom_conv_factor(uom, stock_uom):
 		"UOM Conversion Factor", {"to_uom": from_uom, "from_uom": to_uom}, ["value"], as_dict=1
 	)
 	if inverse_match:
-		return 1 / inverse_match.value
+		return flt(1 / inverse_match.value, frappe.get_precision("UOM Conversion Factor", "value"))
 
 	# This attempts to try and get conversion from intermediate UOM.
 	# case:
@@ -1495,7 +1621,7 @@ def get_uom_conv_factor(uom, stock_uom):
 	)
 
 	if intermediate_match:
-		return intermediate_match[0].value
+		return flt(intermediate_match[0].value, frappe.get_precision("UOM Conversion Factor", "value"))
 
 
 @frappe.whitelist()
@@ -1559,39 +1685,200 @@ def get_child_warehouses(warehouse):
 	return get_child_warehouses(warehouse)
 
 
+ITEM_PRICES_LIMIT = 10
+
+
 @frappe.whitelist()
 def get_item_prices(item_code: str):
 	"""Fetch valid item prices for the item prices tab."""
-	if not frappe.has_permission("Item Price", "read"):
-		frappe.throw(_("Not permitted"), frappe.PermissionError)
+	frappe.has_permission("Item Price", "read", throw=True)
 	today = getdate()
 
-	ItemPrice = frappe.qb.DocType("Item Price")
-
-	prices = (
-		frappe.qb.from_(ItemPrice)
-		.select(
-			ItemPrice.name,
-			ItemPrice.price_list,
-			ItemPrice.price_list_rate,
-			ItemPrice.currency,
-			ItemPrice.uom,
-			ItemPrice.customer,
-			ItemPrice.supplier,
-			ItemPrice.buying,
-			ItemPrice.selling,
-			ItemPrice.valid_upto,
-		)
-		.where(ItemPrice.item_code == item_code)
-		.where(ItemPrice.docstatus != 2)
-		.where((ItemPrice.valid_upto.isnull()) | (ItemPrice.valid_upto >= today))
-		.orderby(ItemPrice.price_list)
-		.limit(11)
-		.run(as_dict=True)
+	# get_list, not get_all: otherwise a caller restricted to one Price List sees every party's negotiated rate
+	prices = frappe.get_list(
+		"Item Price",
+		filters={"item_code": item_code, "docstatus": ["!=", 2]},
+		or_filters=[["valid_upto", "is", "not set"], ["valid_upto", ">=", today]],
+		fields=[
+			"name",
+			"price_list",
+			"price_list_rate",
+			"currency",
+			"uom",
+			"customer",
+			"supplier",
+			"buying",
+			"selling",
+			"valid_upto",
+		],
+		order_by="price_list",
+		limit=ITEM_PRICES_LIMIT + 1,
 	)
 
-	has_more = len(prices) == 11
 	return {
-		"prices": prices[:10],
-		"has_more": has_more,
+		"prices": prices[:ITEM_PRICES_LIMIT],
+		"has_more": len(prices) > ITEM_PRICES_LIMIT,
 	}
+
+
+@frappe.whitelist()
+def make_opening_stock_entry(
+	item_code: str,
+	company: str,
+	qty: float,
+	valuation_rate: float,
+	warehouse: str | None = None,
+):
+	if not frappe.has_permission("Item", "write", item_code):
+		frappe.throw(_("Not permitted"), frappe.PermissionError)
+
+	item = frappe.get_doc("Item", item_code)
+
+	if not item.is_stock_item:
+		frappe.throw(_("Opening Stock can only be set for stock items."))
+	if item.has_serial_no or item.has_batch_no:
+		frappe.throw(
+			_("Opening Stock for serialised or batch items must be set via the Stock Reconciliation form.")
+		)
+	if item.stock_ledger_created():
+		frappe.throw(
+			_("Opening Stock cannot be created as stock transactions already exist for item {0}.").format(
+				frappe.bold(item_code)
+			)
+		)
+
+	if flt(qty) <= 0:
+		frappe.throw(_("Quantity must be greater than zero."))
+
+	if flt(valuation_rate) < 0:
+		frappe.throw(_("Valuation Rate cannot be negative."))
+
+	if warehouse:
+		warehouse_company = frappe.db.get_value("Warehouse", warehouse, "company")
+		if warehouse_company != company:
+			frappe.throw(_("Warehouse {0} does not belong to Company {1}.").format(warehouse, company))
+
+	target_warehouse = get_default_warehouse_for_opening_stock(item, company, warehouse)
+
+	opening_account = frappe.db.get_value(
+		"Account",
+		{"company": company, "account_type": "Temporary", "is_group": 0},
+		"name",
+	)
+
+	if not opening_account:
+		frappe.throw(
+			_(
+				"Please set a Temporary Opening account for company {0} to create an Opening Stock reconciliation."
+			).format(frappe.bold(company))
+		)
+
+	stock_reco = create_opening_stock_reconciliation(
+		item_code=item_code,
+		company=company,
+		qty=qty,
+		valuation_rate=valuation_rate,
+		warehouse=target_warehouse,
+		expense_account=opening_account,
+	)
+	stock_reco.add_comment("Comment", _("Opening Stock"))
+
+	frappe.msgprint(
+		_("Opening Stock reconciliation created: {0}").format(
+			get_link_to_form("Stock Reconciliation", stock_reco.name)
+		),
+		indicator="green",
+		alert=True,
+	)
+
+	return stock_reco.name
+
+
+def create_opening_stock_reconciliation(
+	item_code: str,
+	company: str,
+	qty: float,
+	valuation_rate: float,
+	warehouse: str,
+	expense_account: str,
+):
+	stock_reco = frappe.get_doc(
+		{
+			"doctype": "Stock Reconciliation",
+			"purpose": "Opening Stock",
+			"company": company,
+			"expense_account": expense_account,
+			"items": [
+				{
+					"item_code": item_code,
+					"warehouse": warehouse,
+					"qty": flt(qty),
+					"valuation_rate": flt(valuation_rate),
+					"allow_zero_valuation_rate": 1 if flt(valuation_rate) == 0 else 0,
+					"reconcile_all_serial_batch": 1,
+				}
+			],
+		}
+	)
+
+	stock_reco.insert()
+	set_opening_stock_serial_batch_bundle(stock_reco)
+	stock_reco.submit()
+
+	return stock_reco
+
+
+def set_opening_stock_serial_batch_bundle(stock_reco):
+	row = stock_reco.items[0]
+	item_details = frappe.get_cached_value(
+		"Item", row.item_code, ["has_serial_no", "has_batch_no"], as_dict=1
+	)
+
+	if not (item_details.has_serial_no or item_details.has_batch_no):
+		return
+
+	bundle = SerialBatchCreation(
+		{
+			"item_code": row.item_code,
+			"warehouse": row.warehouse,
+			"voucher_type": stock_reco.doctype,
+			"voucher_no": stock_reco.name,
+			"voucher_detail_no": row.name,
+			"posting_date": stock_reco.posting_date,
+			"posting_time": stock_reco.posting_time,
+			"qty": row.qty,
+			"avg_rate": row.valuation_rate,
+			"type_of_transaction": "Inward",
+			"company": stock_reco.company,
+			"do_not_submit": True,
+		}
+	).make_serial_and_batch_bundle()
+
+	if not bundle:
+		return
+
+	row.db_set("serial_and_batch_bundle", bundle.name, update_modified=False)
+	row.serial_and_batch_bundle = bundle.name
+
+
+def get_default_warehouse_for_opening_stock(item, company: str, warehouse: str | None):
+	if warehouse:
+		return warehouse
+
+	for default in item.item_defaults:
+		if default.company == company and default.default_warehouse:
+			return default.default_warehouse
+
+	if company_warehouse := frappe.get_cached_value("Company", company, "default_warehouse"):
+		return company_warehouse
+
+	stores_warehouse = frappe.db.get_value("Warehouse", {"warehouse_name": _("Stores"), "company": company})
+
+	if stores_warehouse:
+		return stores_warehouse
+
+	frappe.throw(
+		_(
+			"No warehouse found for company {0}. Please set a Default Warehouse in Item Defaults or Company."
+		).format(frappe.bold(company))
+	)

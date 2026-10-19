@@ -7,6 +7,7 @@ from itertools import groupby
 
 import frappe
 from frappe import _, bold
+from frappe.model.document import Document
 from frappe.model.mapper import map_child_doc
 from frappe.query_builder import Case
 from frappe.query_builder.custom import GROUP_CONCAT
@@ -496,9 +497,10 @@ class PickList(TransactionBase):
 		for sales_order in sales_orders:
 			frappe.get_doc("Sales Order", sales_order, for_update=True).update_picking_status()
 
-	@frappe.whitelist()
+	@frappe.whitelist(methods=["POST"])
 	def create_stock_reservation_entries(self, notify=True) -> None:
 		"""Creates Stock Reservation Entries for Sales Order Items against Pick List."""
+		self.check_permission("write")
 
 		so_items_details_map = {}
 		for location in self.locations:
@@ -517,15 +519,16 @@ class PickList(TransactionBase):
 		if so_items_details_map:
 			for so, items_details in so_items_details_map.items():
 				so_doc = frappe.get_doc("Sales Order", so)
-				so_doc.create_stock_reservation_entries(
+				so_doc._create_stock_reservation_entries(
 					items_details=items_details,
 					from_voucher_type="Pick List",
 					notify=notify,
 				)
 
-	@frappe.whitelist()
+	@frappe.whitelist(methods=["POST"])
 	def cancel_stock_reservation_entries(self, notify=True) -> None:
 		"""Cancel Stock Reservation Entries for Sales Order Items created against Pick List."""
+		self.check_permission("write")
 
 		from erpnext.stock.doctype.stock_reservation_entry.stock_reservation_entry import (
 			cancel_stock_reservation_entries,
@@ -548,8 +551,12 @@ class PickList(TransactionBase):
 					).format(row.item_code, row.sales_order)
 				)
 
-	@frappe.whitelist()
+	@frappe.whitelist(methods=["POST"])
 	def set_item_locations(self, save=False):
+		# gate up front, but only for a saved list: the mappers reach this on an unsaved one.
+		# Test the record, not is_new() -- `__islocal` arrives in the client's own JSON.
+		if self.name and frappe.db.exists("Pick List", self.name):
+			self.check_permission("write")
 		self.validate_for_qty()
 		items = self.aggregate_item_qty()
 		picked_items_details = self.get_picked_items_details(items)
@@ -763,6 +770,9 @@ class PickList(TransactionBase):
 			key = (item_data.warehouse, item_data.batch_no) if item_data.batch_no else item_data.warehouse
 			serial_no = [x for x in item_data.serial_no.split("\n") if x] if item_data.serial_no else None
 
+			if item_data.item_code not in picked_items:
+				picked_items[item_data.item_code] = {}
+
 			if item_data.serial_and_batch_bundle:
 				if not serial_no:
 					serial_no = get_serial_nos_from_bundle(item_data.serial_and_batch_bundle)
@@ -773,15 +783,11 @@ class PickList(TransactionBase):
 						batch_qty = abs(batch_qty)
 
 						key = (item_data.warehouse, batch_no)
-						if item_data.item_code not in picked_items:
-							picked_items[item_data.item_code] = {key: {"picked_qty": batch_qty}}
-						else:
-							picked_items[item_data.item_code][key]["picked_qty"] += batch_qty
+						if key not in picked_items[item_data.item_code]:
+							picked_items[item_data.item_code][key] = {"picked_qty": 0}
+						picked_items[item_data.item_code][key]["picked_qty"] += batch_qty
 
 					continue
-
-			if item_data.item_code not in picked_items:
-				picked_items[item_data.item_code] = {}
 
 			if key not in picked_items[item_data.item_code]:
 				picked_items[item_data.item_code][key] = frappe._dict(
@@ -1321,8 +1327,11 @@ def create_delivery_note(source_name, target_doc=None):
 
 
 @frappe.whitelist()
-def create_delivery(source_name, target_doc=None, target=None):
+def create_delivery(
+	source_name: str, target_doc: str | dict | Document | None = None, target: str | None = None
+):
 	pick_list = frappe.get_doc("Pick List", source_name)
+	pick_list.check_permission("read")
 	target = target or (frappe.flags.args or {}).get("target") or "Delivery Note"
 	validate_item_locations(pick_list)
 	sales_dict = dict()
@@ -1402,7 +1411,9 @@ def create_delivery_wo_so(pick_list, target, target_doc=None):
 
 
 @frappe.whitelist()
-def create_dn_for_pick_lists(source_name, target_doc=None, kwargs=None):
+def create_dn_for_pick_lists(
+	source_name: str, target_doc: str | dict | Document | None = None, kwargs: str | dict | None = None
+):
 	"""Get Items from Multiple Pick Lists and create a Delivery Note for filtered customer"""
 	if kwargs is None:
 		kwargs = {}
@@ -1410,6 +1421,7 @@ def create_dn_for_pick_lists(source_name, target_doc=None, kwargs=None):
 		kwargs = json.loads(kwargs)
 
 	pick_list = frappe.get_doc("Pick List", source_name)
+	pick_list.check_permission("read")
 	validate_item_locations(pick_list)
 
 	sales_order_arg = kwargs.get("sales_order")
@@ -1582,6 +1594,7 @@ def add_product_bundles_to_target(pick_list, target_doc, item_mapper, sales_orde
 @frappe.whitelist()
 def create_stock_entry(pick_list: str | dict):
 	pick_list = frappe.get_doc(frappe.parse_json(pick_list))
+	pick_list.check_permission("read")
 	validate_item_locations(pick_list)
 
 	stock_entry = frappe.new_doc("Stock Entry")
@@ -1614,6 +1627,8 @@ def create_stock_entry(pick_list: str | dict):
 
 @frappe.whitelist()
 def get_pending_work_orders(doctype, txt, searchfield, start, page_length, filters, as_dict):
+	# same guard as the sibling get_pick_list_query; a Work Order guard would lose Stock and Manufacturing Manager
+	frappe.has_permission("Pick List", throw=True)
 	wo = frappe.qb.DocType("Work Order")
 	return (
 		frappe.qb.from_(wo)
@@ -1634,6 +1649,7 @@ def get_pending_work_orders(doctype, txt, searchfield, start, page_length, filte
 
 @frappe.whitelist()
 def get_item_details(item_code, uom=None, warehouse=None, company=None):
+	frappe.has_permission("Pick List", throw=True)
 	details = frappe.db.get_value("Item", item_code, "stock_uom", as_dict=1)
 	details.uom = uom or details.stock_uom
 	if uom:

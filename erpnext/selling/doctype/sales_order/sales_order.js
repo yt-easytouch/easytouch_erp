@@ -159,6 +159,11 @@ frappe.ui.form.on("Sales Order", {
 							frm.set_df_property("reserve_stock", "hidden", 1);
 							frm.fields_dict.items.grid.update_docfield_property("reserve_stock", "hidden", 1);
 							frm.fields_dict.items.grid.update_docfield_property(
+								"ensure_delivery_based_on_produced_serial_no",
+								"hidden",
+								1
+							);
+							frm.fields_dict.items.grid.update_docfield_property(
 								"reserve_stock",
 								"default",
 								0
@@ -1070,7 +1075,8 @@ erpnext.selling.SalesOrderController = class SalesOrderController extends erpnex
 
 					// sales invoice
 					if (
-						(flt(doc.per_billed) < 100 && frappe.model.can_create("Sales Invoice")) ||
+						(doc.__onload?.has_potentially_billable_items &&
+							frappe.model.can_create("Sales Invoice")) ||
 						doc.is_subcontracted
 					) {
 						this.frm.add_custom_button(

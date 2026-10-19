@@ -3,6 +3,7 @@
 
 
 import json
+from datetime import date
 from functools import reduce
 
 import frappe
@@ -50,7 +51,6 @@ from erpnext.accounts.utils import (
 )
 from erpnext.controllers.accounts_controller import (
 	AccountsController,
-	get_supplier_block_status,
 	validate_taxes_and_charges,
 )
 from erpnext.setup.utils import get_exchange_rate
@@ -175,6 +175,7 @@ class PaymentEntry(AccountsController):
 		self.set_liability_account()
 		self.set_missing_ref_details(force=True)
 		self.validate_payment_type()
+		self.validate_internal_transfer_accounts()
 		self.validate_party_details()
 		self.set_exchange_rate()
 		self.validate_mandatory()
@@ -207,8 +208,14 @@ class PaymentEntry(AccountsController):
 		self.update_payment_schedule()
 		self.make_gl_entries()
 		self.update_outstanding_amounts()
+		self.update_linked_dunnings()
 		self.set_status()
 		self.trigger_invoice_update_for_subscriptions()
+
+	def update_linked_dunnings(self):
+		from erpnext.accounts.doctype.dunning.dunning import update_dunnings_linked_to_payment
+
+		update_dunnings_linked_to_payment(self)
 
 	def validate_for_repost(self):
 		validate_docs_for_voucher_types(["Payment Entry"])
@@ -313,6 +320,7 @@ class PaymentEntry(AccountsController):
 		self.update_payment_schedule(cancel=1)
 		self.make_gl_entries(cancel=1)
 		self.update_outstanding_amounts()
+		self.update_linked_dunnings()
 		self.delink_advance_entry_references()
 		self.set_status()
 		self.trigger_invoice_update_for_subscriptions()
@@ -374,11 +382,15 @@ class PaymentEntry(AccountsController):
 
 		fail_message = _("Row #{0}: Allocated Amount cannot be greater than outstanding amount.")
 		for d in self.get("references"):
-			if (flt(d.allocated_amount)) > 0 and flt(d.allocated_amount) > flt(d.outstanding_amount):
+			precision = d.precision("allocated_amount")
+			allocated_amount = flt(d.allocated_amount, precision)
+			outstanding_amount = flt(d.outstanding_amount, precision)
+
+			if allocated_amount > 0 and allocated_amount > outstanding_amount:
 				frappe.throw(fail_message.format(d.idx))
 
 			# Check for negative outstanding invoices as well
-			if flt(d.allocated_amount) < 0 and flt(d.allocated_amount) < flt(d.outstanding_amount):
+			if allocated_amount < 0 and allocated_amount < outstanding_amount:
 				frappe.throw(fail_message.format(d.idx))
 
 	def validate_allocated_amount_as_per_payment_request(self):
@@ -479,12 +491,16 @@ class PaymentEntry(AccountsController):
 
 			fail_message = _("Row #{0}: Allocated Amount cannot be greater than outstanding amount.")
 
+			precision = d.precision("allocated_amount")
+			allocated_amount = flt(d.allocated_amount, precision)
+			outstanding_amount = flt(latest.outstanding_amount, precision)
+
 			if (
 				d.payment_term
 				and (
-					(flt(d.allocated_amount)) > 0
+					allocated_amount > 0
 					and latest.payment_term_outstanding
-					and (flt(d.allocated_amount) > flt(latest.payment_term_outstanding))
+					and (allocated_amount > flt(latest.payment_term_outstanding, precision))
 				)
 				and self.term_based_allocation_enabled_for_reference(d.reference_doctype, d.reference_name)
 			):
@@ -494,11 +510,11 @@ class PaymentEntry(AccountsController):
 					).format(d.idx, d.allocated_amount, latest.payment_term_outstanding, d.payment_term)
 				)
 
-			if (flt(d.allocated_amount)) > 0 and flt(d.allocated_amount) > flt(latest.outstanding_amount):
+			if allocated_amount > 0 and allocated_amount > outstanding_amount:
 				frappe.throw(fail_message.format(d.idx))
 
 			# Check for negative outstanding invoices as well
-			if flt(d.allocated_amount) < 0 and flt(d.allocated_amount) < flt(latest.outstanding_amount):
+			if allocated_amount < 0 and allocated_amount < outstanding_amount:
 				frappe.throw(fail_message.format(d.idx))
 
 	def delink_advance_entry_references(self):
@@ -622,6 +638,10 @@ class PaymentEntry(AccountsController):
 	def validate_payment_type(self):
 		if self.payment_type not in ("Receive", "Pay", "Internal Transfer"):
 			frappe.throw(_("Payment Type must be one of Receive, Pay and Internal Transfer"))
+
+	def validate_internal_transfer_accounts(self):
+		if self.payment_type == "Internal Transfer" and self.paid_from and self.paid_from == self.paid_to:
+			frappe.throw(_("Paid From and Paid To accounts must be different for an Internal Transfer."))
 
 	def validate_party_details(self):
 		if self.party and not frappe.db.exists(self.party_type, self.party):
@@ -2311,18 +2331,10 @@ def get_outstanding_reference_documents(args, validate=False):
 	accounting_dimensions_filter = []
 	posting_and_due_date = []
 
-	# confirm that Supplier is not blocked
-	if args.get("party_type") == "Supplier":
-		supplier_status = get_supplier_block_status(args["party"])
-		if supplier_status["on_hold"]:
-			if supplier_status["hold_type"] == "All":
-				return []
-			elif supplier_status["hold_type"] == "Payments":
-				if (
-					not supplier_status["release_date"]
-					or getdate(nowdate()) <= supplier_status["release_date"]
-				):
-					return []
+	if args.get("party_type") == "Supplier" and frappe.get_lazy_doc("Supplier", args["party"]).is_blocked_for(
+		"Payments"
+	):
+		return []
 
 	party_account_currency = get_account_currency(args.get("party_account"))
 	company_currency = frappe.get_cached_value("Company", args.get("company"), "default_currency")
@@ -2676,7 +2688,7 @@ def get_negative_outstanding_invoices(
 			"{voucher_type}" as voucher_type, name as voucher_no, {account} as account,
 			if({rounded_total_field}, {rounded_total_field}, {grand_total_field}) as invoice_amount,
 			outstanding_amount, posting_date,
-			due_date, conversion_rate as exchange_rate
+			due_date, conversion_rate as exchange_rate, %s as currency
 		from
 			`tab{voucher_type}`
 		where
@@ -2686,8 +2698,8 @@ def get_negative_outstanding_invoices(
 			{condition}
 		order by
 			posting_date, name
-		""".format(
-			**{
+		""".format_map(
+			{
 				"supplier_condition": supplier_condition,
 				"condition": condition,
 				"rounded_total_field": rounded_total_field,
@@ -2699,7 +2711,7 @@ def get_negative_outstanding_invoices(
 				"account": account,
 			}
 		),
-		(party, party_account),
+		(party_account_currency, party, party_account),
 		as_dict=True,
 	)
 
@@ -2755,6 +2767,7 @@ def get_account_details(account, date, cost_center=None):
 
 @frappe.whitelist()
 def get_company_defaults(company):
+	frappe.has_permission("Company", doc=company, throw=True)
 	fields = ["write_off_account", "exchange_gain_loss_account", "cost_center"]
 	return frappe.get_cached_value("Company", company, fields, as_dict=1)
 
@@ -2883,17 +2896,21 @@ def get_reference_details(
 
 @frappe.whitelist()
 def get_payment_entry(
-	dt,
-	dn,
-	party_amount=None,
-	bank_account=None,
-	bank_amount=None,
-	party_type=None,
-	payment_type=None,
-	reference_date=None,
-	created_from_payment_request=False,
+	dt: str,
+	dn: str,
+	party_amount: int | float | None = None,
+	bank_account: str | None = None,
+	bank_amount: int | float | None = None,
+	party_type: str | None = None,
+	payment_type: str | None = None,
+	reference_date: str | date | None = None,
+	created_from_payment_request: bool | None = False,
 ):
+	frappe.has_permission("Payment Entry", ptype="create", throw=True)
+
 	doc = frappe.get_doc(dt, dn)
+	doc.check_permission()
+
 	over_billing_allowance = frappe.get_single_value("Accounts Settings", "over_billing_allowance")
 	if dt in ("Sales Order", "Purchase Order") and flt(doc.per_billed, 2) >= (100.0 + over_billing_allowance):
 		frappe.throw(_("Can only make payment against unbilled {0}").format(_(dt)))
@@ -2988,7 +3005,7 @@ def get_payment_entry(
 				pe.append("references", reference)
 		else:
 			if dt == "Dunning":
-				for overdue_payment in doc.overdue_payments:
+				for overdue_payment, outstanding in doc.get_unpaid_overdue_payments():
 					pe.append(
 						"references",
 						{
@@ -2996,21 +3013,23 @@ def get_payment_entry(
 							"reference_name": overdue_payment.sales_invoice,
 							"payment_term": overdue_payment.payment_term,
 							"due_date": overdue_payment.due_date,
-							"total_amount": overdue_payment.outstanding,
-							"outstanding_amount": overdue_payment.outstanding,
-							"allocated_amount": overdue_payment.outstanding,
+							"total_amount": outstanding,
+							"outstanding_amount": outstanding,
+							"allocated_amount": outstanding,
 						},
 					)
 
-				pe.append(
-					"deductions",
-					{
-						"account": doc.income_account,
-						"cost_center": doc.cost_center,
-						"amount": -1 * doc.dunning_amount,
-						"description": _("Interest and/or dunning fee"),
-					},
-				)
+				if (unpaid_dunning_amount := doc.get_unpaid_base_dunning_amount()) > 0:
+					pe.append(
+						"deductions",
+						{
+							"account": doc.income_account,
+							"cost_center": doc.cost_center,
+							"amount": -1 * unpaid_dunning_amount,
+							"description": _("Interest and/or dunning fee"),
+							"dunning": doc.name,
+						},
+					)
 			else:
 				pe.append(
 					"references",
@@ -3300,8 +3319,10 @@ def set_grand_total_and_outstanding_amount(party_amount, dt, party_account_curre
 			grand_total = doc.rounded_total or doc.grand_total
 		outstanding_amount = doc.outstanding_amount
 	elif dt == "Dunning":
-		grand_total = doc.grand_total
-		outstanding_amount = doc.grand_total
+		# only what is left to collect, the totals on the dunning are the ones it was raised with
+		grand_total = sum(outstanding for _row, outstanding in doc.get_unpaid_overdue_payments())
+		grand_total += doc.get_unpaid_dunning_amount()
+		outstanding_amount = grand_total
 	else:
 		if party_account_currency == doc.company_currency:
 			grand_total = flt(doc.get("base_rounded_total") or doc.get("base_grand_total"))

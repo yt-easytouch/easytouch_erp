@@ -22,6 +22,7 @@ from erpnext.stock.doctype.item.item import (
 	get_item_attribute,
 	get_timeline_data,
 	get_uom_conv_factor,
+	set_item_default,
 	validate_is_stock_item,
 )
 from erpnext.stock.doctype.stock_entry.stock_entry_utils import make_stock_entry
@@ -372,6 +373,18 @@ class TestItem(ERPNextTestSuite):
 		)
 		for key, value in purchase_item_check.items():
 			self.assertEqual(value, purchase_item_details.get(key))
+
+	def test_set_item_default_refreshes_cached_item(self):
+		item = make_item(
+			properties={
+				"item_defaults": [{"default_warehouse": "_Test Warehouse - _TC", "company": "_Test Company"}]
+			}
+		)
+
+		set_item_default(item.name, "_Test Company", "income_account", "_Test Account Sales - _TC")
+
+		cached_item = frappe.get_cached_doc("Item", item.name)
+		self.assertEqual(cached_item.item_defaults[0].income_account, "_Test Account Sales - _TC")
 
 	def test_item_default_validations(self):
 		with self.assertRaises(frappe.ValidationError) as ve:
@@ -741,6 +754,17 @@ class TestItem(ERPNextTestSuite):
 
 		self.assertFalse(frappe.db.exists("Item", "Test Item Bundle Item 1"))
 
+	def test_invalid_uom_conversion_factor(self):
+		for conversion_factor in (0, -1):
+			with self.subTest(conversion_factor=conversion_factor), self.assertRaisesRegex(
+				frappe.ValidationError, "Conversion Factor must be greater than zero"
+			):
+				make_item(uoms=[{"uom": "Box", "conversion_factor": conversion_factor}])
+
+	def test_preserve_explicit_uom_conversion_factor(self):
+		item = make_item(properties={"stock_uom": "Gram"}, uoms=[{"uom": "Kg", "conversion_factor": 950}])
+		self.assertEqual(item.uoms[0].conversion_factor, 950)
+
 	def test_uom_conversion_factor(self):
 		if frappe.db.exists("Item", "Test Item UOM"):
 			frappe.delete_doc("Item", "Test Item UOM")
@@ -749,14 +773,24 @@ class TestItem(ERPNextTestSuite):
 			"Test Item UOM", {"stock_uom": "Gram", "uoms": [dict(uom="Carat"), dict(uom="Kg")]}
 		)
 
-		for d in item_doc.uoms:
-			value = get_uom_conv_factor(d.uom, item_doc.stock_uom)
-			d.conversion_factor = value
-
 		self.assertEqual(item_doc.uoms[0].uom, "Carat")
 		self.assertEqual(item_doc.uoms[0].conversion_factor, 0.2)
 		self.assertEqual(item_doc.uoms[1].uom, "Kg")
 		self.assertEqual(item_doc.uoms[1].conversion_factor, 1000)
+
+	def test_item_uom_conversion_factor_overrides_global_factor(self):
+		custom_factor = 10.76
+		global_factor = get_uom_conv_factor("Square Meter", "Square Foot")
+		self.assertNotEqual(custom_factor, global_factor)
+
+		item = make_item(
+			properties={"stock_uom": "Square Foot"},
+			uoms=[{"uom": "Square Meter", "conversion_factor": custom_factor}],
+		)
+		item.reload()
+
+		conversion_factor = next(row.conversion_factor for row in item.uoms if row.uom == "Square Meter")
+		self.assertEqual(conversion_factor, custom_factor)
 
 	def test_uom_conv_intermediate(self):
 		factor = get_uom_conv_factor("Pound", "Gram")
@@ -930,7 +964,10 @@ class TestItem(ERPNextTestSuite):
 		item.reload()
 		item.stock_uom = "Nos"
 		item.save()
-		self.assertEqual(len(item.uoms), 1)
+		self.assertEqual(
+			[(row.uom, row.conversion_factor) for row in item.uoms],
+			[("Nos", 1)],
+		)
 
 	def test_validate_stock_item(self):
 		self.assertRaises(frappe.ValidationError, validate_is_stock_item, "_Test Non Stock Item")
@@ -939,6 +976,32 @@ class TestItem(ERPNextTestSuite):
 			validate_is_stock_item("_Test Item")
 		except frappe.ValidationError as e:
 			self.fail(f"stock item considered non-stock item: {e}")
+
+	def test_serial_and_batch_flags_blocked_when_not_activated(self):
+		serial_item = make_item("_Test Serial Activation Item", {"has_serial_no": 1})
+		batch_item = make_item("_Test Batch Activation Item", {"has_batch_no": 1, "create_new_batch": 1})
+		plain_item = make_item("_Test Serial Batch Plain Item")
+
+		# set directly as test data already has serial / batch records blocking the settings save
+		frappe.db.set_single_value("Stock Settings", "enable_serial_and_batch_no_for_item", 0)
+		self.addCleanup(
+			frappe.db.set_single_value, "Stock Settings", "enable_serial_and_batch_no_for_item", 1
+		)
+
+		for fieldname in ("has_serial_no", "has_batch_no"):
+			with self.assertRaisesRegex(frappe.ValidationError, "Activate Serial / Batch No for Item"):
+				make_item(f"_Test New {fieldname} Item", {fieldname: 1})
+
+			item = frappe.get_doc("Item", plain_item.name)
+			item.set(fieldname, 1)
+			with self.assertRaisesRegex(frappe.ValidationError, "Activate Serial / Batch No for Item"):
+				item.save()
+
+		# items already tracking serial / batch stay editable
+		for item in (serial_item, batch_item):
+			item.reload()
+			item.description = "Updated after deactivation"
+			item.save()
 
 	@ERPNextTestSuite.change_settings("Stock Settings", {"item_naming_by": "Naming Series"})
 	def test_autoname_series(self):
@@ -971,10 +1034,8 @@ class TestItem(ERPNextTestSuite):
 		)
 		self.consume_item_code_with_differet_stock_transactions(item_code=item.name)
 
-	@ERPNextTestSuite.change_settings(
-		"Stock Settings", {"sample_retention_warehouse": "_Test Warehouse - _TC"}
-	)
 	def test_retain_sample(self):
+		frappe.db.set_value("Company", "_Test Company", "sample_retention_warehouse", "_Test Warehouse - _TC")
 		item = make_item("_TestRetainSample", {"has_batch_no": 1, "retain_sample": 1, "sample_quantity": 1})
 
 		self.assertEqual(item.has_batch_no, 1)
@@ -1196,6 +1257,83 @@ class TestItem(ERPNextTestSuite):
 		doc.has_serial_no = 0
 		doc.save()
 		self.assertEqual(frappe.db.get_value("Item", item, "has_serial_no"), 0)
+
+	def test_opening_stock_requires_serial_and_batch_settings(self):
+		setups = (
+			({"has_serial_no": 1}, "Serial Number Series"),
+			({"has_batch_no": 1, "create_new_batch": 0}, "Automatically Create New Batch"),
+		)
+		for properties, message in setups:
+			with self.subTest(properties=properties), self.assertRaisesRegex(frappe.ValidationError, message):
+				make_item(
+					properties={"is_stock_item": 1, "opening_stock": 5, "valuation_rate": 100, **properties}
+				)
+
+	def test_opening_stock_for_batch_without_series(self):
+		item = make_item(
+			properties={
+				"is_stock_item": 1,
+				"has_batch_no": 1,
+				"create_new_batch": 1,
+				"opening_stock": 5,
+				"valuation_rate": 100,
+				"item_defaults": [{"company": "_Test Company", "default_warehouse": "_Test Warehouse - _TC"}],
+			}
+		)
+
+		actual_qty = frappe.db.get_value(
+			"Stock Ledger Entry", {"item_code": item.name, "is_cancelled": 0}, "actual_qty"
+		)
+		self.assertEqual(actual_qty, 5)
+
+	@ERPNextTestSuite.change_settings("Global Defaults", {"default_company": "_Test Company"})
+	def test_opening_stock_for_serial_batch(self):
+		items = {
+			"Test Opening Stock for Serial No": {
+				"has_serial_no": 1,
+				"opening_stock": 5,
+				"serial_no_series": "SN-TOPN-.####",
+				"valuation_rate": 100,
+			},
+			"Test Opening Stock for Batch No": {
+				"has_batch_no": 1,
+				"opening_stock": 5,
+				"batch_number_series": "BCH-TOPN-.####",
+				"valuation_rate": 100,
+				"create_new_batch": 1,
+			},
+			"Test Opening Stock for Serial and Batch No": {
+				"has_serial_no": 1,
+				"has_batch_no": 1,
+				"opening_stock": 5,
+				"batch_number_series": "SN-BCH-TOPN-.####",
+				"serial_no_series": "BCH-SN-TOPN-.####",
+				"valuation_rate": 100,
+				"create_new_batch": 1,
+			},
+		}
+
+		for item_code, properties in items.items():
+			make_item(item_code, properties)
+
+			stock_entry_bundle = frappe.db.get_value(
+				"Stock Entry Detail", {"docstatus": 1, "item_code": item_code}, "serial_and_batch_bundle"
+			)
+			self.assertFalse(stock_entry_bundle)
+
+			serial_and_batch_bundle = frappe.db.get_value(
+				"Stock Ledger Entry",
+				{
+					"voucher_type": "Stock Reconciliation",
+					"is_cancelled": 0,
+					"item_code": item_code,
+				},
+				"serial_and_batch_bundle",
+			)
+			self.assertTrue(serial_and_batch_bundle)
+
+			sabb_qty = frappe.db.get_value("Serial and Batch Bundle", serial_and_batch_bundle, "total_qty")
+			self.assertEqual(abs(sabb_qty), properties["opening_stock"])
 
 
 def set_item_variant_settings(fields):

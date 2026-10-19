@@ -101,8 +101,27 @@ frappe.ui.form.on("Material Request", {
 		erpnext.accounts.dimensions.setup_dimension_filters(frm, frm.doctype);
 		if (!frm.doc.buying_price_list) {
 			const buying_price_list = frappe.defaults.get_default("buying_price_list");
-			if (frappe.has_permission("Price List", "read", buying_price_list)) {
-				frm.set_value("buying_price_list", buying_price_list);
+			if (buying_price_list) {
+				const docname = frm.doc.name;
+				frappe.call({
+					type: "GET",
+					method: "frappe.client.has_permission",
+					no_spinner: true,
+					args: {
+						doctype: "Price List",
+						docname: buying_price_list,
+						perm_type: "read",
+					},
+					callback: ({ message }) => {
+						if (
+							message?.has_permission &&
+							frm.doc.name === docname &&
+							!frm.doc.buying_price_list
+						) {
+							frm.set_value("buying_price_list", buying_price_list);
+						}
+					},
+				});
 			}
 		}
 	},
@@ -778,11 +797,10 @@ erpnext.buying.MaterialRequestController = class MaterialRequestController exten
 
 			if (doc.material_request_type == "Customer Provided") {
 				filters.customer = doc.customer;
-			} else if (
-				doc.material_request_type == "Purchase" ||
-				doc.material_request_type == "Subcontracting"
-			) {
+			} else if (doc.material_request_type == "Purchase") {
 				filters = { is_purchase_item: 1 };
+			} else if (doc.material_request_type == "Subcontracting") {
+				filters = { is_stock_item: 1, is_sub_contracted_item: 1 };
 			} else if (doc.material_request_type == "Manufacture") {
 				filters.include_item_in_manufacturing = 1;
 			}
